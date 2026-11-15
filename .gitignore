@@ -1,0 +1,30 @@
+# Compiled binaries & build artifacts
+/rayneo
+/rayneo.exe
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+coverage.*
+
+# Sensitive captures, credentials & local exports (NEVER commit)
+*.har
+*.chlsj
+*.saz
+*.apk
+*.ipa
+*.so
+config.json
+config.json.tmp
+.env*
+/data/
+/rayneo-data/
+/rayneo-export/
+
+# OS & editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

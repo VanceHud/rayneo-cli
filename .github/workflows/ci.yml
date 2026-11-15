@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Build & Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Go Vet
+        run: go vet ./...
+
+      - name: Go Test (Race)
+        run: go test -race -v ./...
+
+      - name: Build Binary
+        run: make build
+
+      - name: Smoke Test CLI
+        run: |
+          ./bin/rayneo -version
+          ./bin/rayneo help --json > /dev/null
