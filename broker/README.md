@@ -78,7 +78,13 @@ npx cf deploy --secrets-file "$SEC_FILE"
 rm -f "$SEC_FILE"
 ```
 
-`cf deploy` prints your HTTPS URL (for example `https://rayneo-token-broker.<your-subdomain>.workers.dev`). You may also bind a custom domain in the Cloudflare Dashboard under **Workers & Pages → Settings → Domains & Routes** (recommended in mainland China so iOS Loon and CLI can reach it directly without proxying `*.workers.dev`).
+`cf deploy` prints your HTTPS URL (for example `https://rayneo-token-broker.<your-subdomain>.workers.dev`). To bind a custom domain directly from the CLI (recommended in mainland China so iOS Loon and CLI can connect without proxying `*.workers.dev`), pass `BROKER_CUSTOM_DOMAIN`:
+
+```bash
+BROKER_CUSTOM_DOMAIN=broker.example.com npx cf workers triggers deploy
+```
+
+(Or bind a custom domain in the Cloudflare Dashboard under **Workers & Pages → Settings → Domains & Routes**.)
 
 ### 3. Local development & unit tests
 
