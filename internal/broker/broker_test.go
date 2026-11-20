@@ -133,6 +133,40 @@ func TestFetchErrorsAndSanitization(t *testing.T) {
 		}
 	})
 
+	t.Run("403 forbidden", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"ok":false,"error":"forbidden"}`))
+		}))
+		defer srv.Close()
+
+		cl := &Client{HTTP: srv.Client()}
+		_, notMod, err := cl.Fetch(context.Background(), srv.URL, testSecret, "")
+		if !errors.Is(err, ErrForbidden) || notMod {
+			t.Fatalf("expected ErrForbidden, got notMod=%v err=%v", notMod, err)
+		}
+	})
+
+	t.Run("untrusted base_url rejected", func(t *testing.T) {
+		for _, badURL := range []string{
+			"https://evil.example.com",
+			"http://xr-api-p.rayneo.cn",
+			"http://127.0.0.1:8080",
+			"https://xr-api-p.rayneo.cn.evil.com",
+		} {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"ok":true,"access_token":"tok123","base_url":"` + badURL + `"}`))
+			}))
+			cl := &Client{HTTP: srv.Client()}
+			_, _, err := cl.Fetch(context.Background(), srv.URL, testSecret, "")
+			srv.Close()
+			if err == nil {
+				t.Fatalf("expected error for untrusted base_url=%q", badURL)
+			}
+		}
+	})
+
 	t.Run("404 no token", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusNotFound)
@@ -286,6 +320,21 @@ func TestApplyToConfigEnforcesNoRefreshAndMergesMetadata(t *testing.T) {
 	// Applying the exact same response again should report changed=false.
 	if ApplyToConfig(cfg, resp) {
 		t.Fatalf("expected changed=false on idempotent ApplyToConfig")
+	}
+
+	// Untrusted base_url passed directly to ApplyToConfig must be ignored.
+	poisonResp := &TokenResponse{
+		OK:          true,
+		AccessToken: "fresh_broker_token_xyz",
+		Source:      "loon:refresh",
+		UpdatedAt:   "2026-11-20T12:00:00Z",
+		ExpiresAt:   "2026-11-20T14:00:00Z",
+		ETag:        `"rev-2-112233445566"`,
+		BaseURL:     "https://attacker.example.com",
+	}
+	ApplyToConfig(cfg, poisonResp)
+	if cfg.BaseURL != "https://xr-api-p.rayneo.cn" {
+		t.Fatalf("untrusted base_url poisoned cfg.BaseURL: %q", cfg.BaseURL)
 	}
 }
 

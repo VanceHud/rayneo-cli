@@ -1,3 +1,11 @@
-# Shared Bearer secret used by iOS Loon and `rayneo sync`.
-# Replace with a strong random secret (e.g. `openssl rand -hex 32`) before deploying.
-BROKER_SECRET=replace-with-your-random-secret
+# Shared Bearer secret used by iOS Loon and `rayneo sync` (minimum 32 chars).
+# Generate a strong random secret (e.g. `openssl rand -hex 32`) before deploying.
+BROKER_SECRET=
+
+# Optional least-privilege read/write secret separation (recommended for AI Agent / multi-host setups):
+# BROKER_READ_SECRET=
+# BROKER_WRITE_SECRET=
+#
+# Optional dedicated at-rest AES-256-GCM encryption key for TokenBrokerDO SQLite storage
+# (defaults to HKDF-SHA256 derived from BROKER_SECRET / BROKER_WRITE_SECRET / BROKER_READ_SECRET):
+# BROKER_ENCRYPTION_KEY=

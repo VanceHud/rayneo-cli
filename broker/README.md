@@ -15,11 +15,12 @@ Two drop-in implementations share the **exact same V1 HTTP contract**:
 
 ## Security Model
 
-- **Zero `refresh_token` handling**: Neither broker accepts, stores, logs, or returns `refresh_token` / `refreshToken`. If present in an incoming request body, it is silently stripped.
-- **Strict 15-header allowlist**: `client_headers` is filtered to the exact 15 non-signed device/app headers from `internal/har/har.go` (`user-agent`, `platform`, `env`, `locale`, `physicalregion`, `time-zone`, `app-version`, `version`, `app-build-number`, `phone-os-version`, `phone-model`, `device-id`, `deviceid`, `device_id`, `device-code`). Headers like `xtcl-*`, `authorization`, `host`, `content-*`, `accept-encoding`, and `cookie` are always dropped.
-- **Fail-closed authentication**: Every endpoint except `GET /health` requires `Authorization: Bearer <BROKER_SECRET>` verified via SHA-256 + constant-time comparison. If `BROKER_SECRET` is unset/empty, protected endpoints return `503 Service Unavailable` (and the Go binary refuses to start).
-- **No caching & no secret logs**: Responses set `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`. Raw `access_token` and `BROKER_SECRET` values are never logged (only the 12-char SHA-256 `token_fp` fingerprint).
-- **Bounded request bodies**: `POST /v1/token` enforces a 64 KiB body limit (`413 Request Entity Too Large` if exceeded).
+- **Zero `refresh_token` handling**: Neither broker accepts, stores, logs, or returns `refresh_token` / `refreshToken`. In the Cloudflare Worker, incoming payloads are validated and projected to the strict allowlisted DTO before crossing the Durable Object RPC boundary.
+- **Strict 15-header & `base_url` allowlists**: `client_headers` is filtered to the exact 15 non-signed device/app headers from `internal/har/har.go` (`user-agent`, `platform`, `env`, `locale`, `physicalregion`, `time-zone`, `app-version`, `version`, `app-build-number`, `phone-os-version`, `phone-model`, `device-id`, `deviceid`, `device_id`, `device-code`). Headers like `xtcl-*`, `authorization`, `host`, `content-*`, `accept-encoding`, and `cookie` are always dropped. `base_url` is strictly validated against `^https://xr-api-[a-z0-9-]+\.rayneo\.(cn|com)$` on both broker and CLI client to prevent API redirect poisoning / SSRF.
+- **Fail-closed Bearer authentication & optional read/write separation**: Every endpoint except `GET /health` requires Bearer auth verified via SHA-256 + constant-time comparison across all configured secret slots. Unset, short (`<32` chars), low-diversity, or placeholder secrets fail closed (`503 Service Unavailable`; Go binary refuses to start). Supports both legacy single `BROKER_SECRET` (full access) and least-privilege `BROKER_READ_SECRET` (`GET` only) + `BROKER_WRITE_SECRET` (`POST` / `DELETE` only).
+- **At-rest protection & automatic expiry purge**: The Cloudflare Worker encrypts `access_token`, `account`, `device_id`, and `client_headers` in DO SQLite using **AES-256-GCM** (HKDF-SHA256 derived key + column-bound AAD, with optional dedicated `BROKER_ENCRYPTION_KEY`) and schedules a Durable Object Alarm to auto-purge state 24 hours after `expires_at` (the Go server likewise auto-purges expired state past the 24h grace window).
+- **Edge, transport & observability hardening**: Responses set `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY`, `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`, `Vary: Authorization`, and HSTS on HTTPS. The Cloudflare Worker enforces HTTPS on non-loopback hosts (`426`), enables per-IP Workers Rate Limiting (`30 req / 60s`), rejects unexpected query parameters (`400`), and enables `observability.redact_query_string: true`. Raw `access_token` and broker secrets are never logged (only the 12-char SHA-256 `token_fp` fingerprint).
+- **Bounded request bodies & anti-downgrade**: `POST /v1/token` enforces `Content-Type: application/json`, strict UTF-8, a 64 KiB body limit (`413`), anti-downgrade protection against stale out-of-order `loon:header` captures, and cross-account metadata reset when `account_id` changes.
 
 ---
 
@@ -27,10 +28,10 @@ Two drop-in implementations share the **exact same V1 HTTP contract**:
 
 | Endpoint | Auth | Description |
 | --- | --- | --- |
-| `GET /health` | None | Liveness probe → `200 {"ok":true,"service":"rayneo-token-broker","version":"1"}` |
-| `POST /v1/token` | Bearer | Upsert access token and merge optional metadata |
-| `GET /v1/token` | Bearer | Fetch current token, TTL status, and ETag (`304` on matching `If-None-Match`, `404` if empty) |
-| `DELETE /v1/token` | Bearer | Clear stored token state from memory and durable storage |
+| `GET /health` | None | Liveness probe → `200 {"ok":true}` |
+| `POST /v1/token` | Bearer (`BROKER_WRITE_SECRET` or `BROKER_SECRET`) | Upsert access token and merge optional metadata |
+| `GET /v1/token` | Bearer (`BROKER_READ_SECRET` or `BROKER_SECRET`) | Fetch current token, TTL status, and ETag (`304` on matching `If-None-Match`, `404` if empty/purged) |
+| `DELETE /v1/token` | Bearer (`BROKER_WRITE_SECRET` or `BROKER_SECRET`) | Clear stored token state from memory and durable storage |
 
 Key behaviors:
 - **TTL non-extension**: When `expires_in` is omitted or `0`:
@@ -121,9 +122,12 @@ Zero external Go dependencies (`broker/server/` lives inside the repository's `g
 
 | Option | Env Variable | Default | Description |
 | --- | --- | --- | --- |
-| *(env only)* | `BROKER_SECRET` | *(required)* | Shared Bearer secret; server refuses to start if unset |
+| *(env only)* | `BROKER_SECRET` | *(required unless read/write set)* | Shared full-access Bearer secret (≥ 32 chars; backward compatible); server refuses to start if unset/weak |
+| *(env only)* | `BROKER_READ_SECRET` | *(optional)* | Least-privilege read-only Bearer secret (`GET /v1/token` only; ≥ 32 chars) |
+| *(env only)* | `BROKER_WRITE_SECRET` | *(optional)* | Least-privilege write Bearer secret (`POST` & `DELETE /v1/token` only; ≥ 32 chars) |
 | `-listen` | `BROKER_LISTEN` | `:8787` | Listen address (bind `127.0.0.1:8787` behind a reverse proxy) |
-| `-state` | `BROKER_STATE_FILE` | `~/.local/share/rayneo-broker/state.json` (or `$XDG_DATA_HOME/rayneo-broker/state.json`, fallback `./broker-state.json`) | Path to persistent state file (written atomically with `0600` perms) |
+| `-state` | `BROKER_STATE_FILE` | `~/.local/share/rayneo-broker/state.json` (or `$XDG_DATA_HOME/rayneo-broker/state.json`, fallback `./broker-state.json`) | Path to persistent state file (written atomically with `0600` perms; auto-purged 24h after expiry) |
+| `-require-https` | `BROKER_REQUIRE_HTTPS` | `false` | When `true`/`1`, rejects requests without TLS or `X-Forwarded-Proto: https` (`426`) |
 
 ### 1. Build & run binary directly
 

@@ -39,3 +39,32 @@ jobs:
         run: |
           ./bin/rayneo -version
           ./bin/rayneo help --json > /dev/null
+
+  cloudflare-broker-and-loon:
+    name: Cloudflare Worker Broker & Loon Script
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: broker/cloudflare/package-lock.json
+
+      - name: Install Cloudflare Worker Dev Dependencies
+        working-directory: broker/cloudflare
+        run: npm ci
+
+      - name: Typecheck, Test & Dry-Run Bundle
+        working-directory: broker/cloudflare
+        run: npm run check
+
+      - name: Audit Cloudflare Worker Dependencies
+        working-directory: broker/cloudflare
+        run: npm audit --audit-level=moderate
+
+      - name: Test Loon Passive Sync Script
+        run: node --test loon/rayneo-token-sync.test.mjs

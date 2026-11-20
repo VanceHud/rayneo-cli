@@ -19,14 +19,24 @@ func main() {
 
 	defaultListen := envOrDefault("BROKER_LISTEN", ":8787")
 	defaultState := defaultStatePath()
+	defaultRequireHTTPS := strings.EqualFold(strings.TrimSpace(os.Getenv("BROKER_REQUIRE_HTTPS")), "true") ||
+		strings.TrimSpace(os.Getenv("BROKER_REQUIRE_HTTPS")) == "1"
 
 	listenAddr := flag.String("listen", defaultListen, "HTTP listen address (env: BROKER_LISTEN)")
 	stateFile := flag.String("state", defaultState, "Path to persistent JSON state file with 0600 perms (env: BROKER_STATE_FILE)")
+	requireHTTPS := flag.Bool("require-https", defaultRequireHTTPS, "Reject non-HTTPS requests without X-Forwarded-Proto: https (env: BROKER_REQUIRE_HTTPS)")
 	flag.Parse()
 
-	secret := strings.TrimSpace(os.Getenv("BROKER_SECRET"))
-	if secret == "" {
-		logger.Fatal("BROKER_SECRET environment variable is required (refusing to start without authentication)")
+	secrets := SecretSet{
+		Shared: os.Getenv("BROKER_SECRET"),
+		Read:   os.Getenv("BROKER_READ_SECRET"),
+		Write:  os.Getenv("BROKER_WRITE_SECRET"),
+	}
+	if ok, reason := secrets.Validate(); !ok {
+		if reason == "weak_or_placeholder_secret" {
+			logger.Fatal("configured broker secret is too weak or a placeholder (minimum 32 random chars, e.g. `openssl rand -hex 32`)")
+		}
+		logger.Fatal("BROKER_SECRET (or BROKER_READ_SECRET / BROKER_WRITE_SECRET) environment variable is required (refusing to start without authentication)")
 	}
 
 	resolvedState := expandHome(strings.TrimSpace(*stateFile))
@@ -35,7 +45,8 @@ func main() {
 		logger.Fatalf("failed to initialize state store (%s): %v", resolvedState, err)
 	}
 
-	broker := NewBroker(store, secret, logger)
+	broker := NewBrokerWithSecrets(store, secrets, logger)
+	broker.requireHTTPS = *requireHTTPS
 
 	srv := &http.Server{
 		Addr:              strings.TrimSpace(*listenAddr),

@@ -684,6 +684,10 @@ func runSync(args []string, debug bool, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stderr, "sync: broker authentication failed (401 Unauthorized) — check -secret or RAYNEO_BROKER_SECRET")
 			return 1
 		}
+		if errors.Is(err, broker.ErrForbidden) {
+			fmt.Fprintln(stderr, "sync: broker access forbidden (403 Forbidden) — use BROKER_READ_SECRET or BROKER_SECRET (not a write-only BROKER_WRITE_SECRET)")
+			return 1
+		}
 		fmt.Fprintln(stderr, "sync:", err)
 		return 1
 	}

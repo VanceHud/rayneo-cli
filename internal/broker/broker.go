@@ -14,18 +14,26 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/VanceHud/rayneo-cli/internal/config"
 )
 
-const maxResponseBytes = 256 * 1024
+const (
+	maxResponseBytes = 256 * 1024
+	maxTokenLen      = 512
+	maxHeaderValLen  = 1024
+)
+
+var rayNeoAPIHostRe = regexp.MustCompile(`(?i)^xr-api-[a-z0-9-]+\.rayneo\.(cn|com)$`)
 
 // Sentinel errors returned by Fetch.
 var (
 	ErrNoToken      = errors.New("broker has no token synced yet")
 	ErrUnauthorized = errors.New("broker authentication failed (401 unauthorized)")
+	ErrForbidden    = errors.New("broker access forbidden (403: secret lacks read permission)")
 )
 
 // allowedClientHeaders mirrors internal/har/har.go's exact 15-header allowlist
@@ -80,6 +88,35 @@ type Client struct {
 // DefaultClient is used by package-level Fetch.
 var DefaultClient = &Client{
 	HTTP: &http.Client{Timeout: 10 * time.Second},
+}
+
+// ValidateRayNeoBaseURL verifies that a non-empty base_url from a broker points
+// strictly to an official RayNeo HTTPS API gateway origin (https://xr-api-*.rayneo.(cn|com)),
+// preventing compromised or misconfigured brokers from redirecting CLI credentials
+// or triggering local SSRF.
+func ValidateRayNeoBaseURL(raw string) (string, bool) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", true
+	}
+	if len(trimmed) > 256 || hasControlChars(trimmed) {
+		return "", false
+	}
+	trimmed = strings.TrimRight(trimmed, "/")
+	u, err := url.Parse(trimmed)
+	if err != nil {
+		return "", false
+	}
+	if !strings.EqualFold(u.Scheme, "https") ||
+		u.User != nil ||
+		u.Port() != "" ||
+		(u.Path != "" && u.Path != "/") ||
+		u.RawQuery != "" ||
+		u.Fragment != "" ||
+		!rayNeoAPIHostRe.MatchString(u.Hostname()) {
+		return "", false
+	}
+	return "https://" + strings.ToLower(u.Hostname()), true
 }
 
 // Fetch retrieves the latest token from <brokerURL>/v1/token using DefaultClient.
@@ -144,6 +181,8 @@ func (c *Client) Fetch(ctx context.Context, brokerURL, secret, ifNoneMatch strin
 	switch resp.StatusCode {
 	case http.StatusUnauthorized:
 		return nil, false, ErrUnauthorized
+	case http.StatusForbidden:
+		return nil, false, ErrForbidden
 	case http.StatusNotFound:
 		return nil, false, ErrNoToken
 	case http.StatusOK:
@@ -176,8 +215,15 @@ func (c *Client) Fetch(ctx context.Context, brokerURL, secret, ifNoneMatch strin
 		return nil, false, fmt.Errorf("broker returned invalid token payload: %s", sanitizeText(err.Error(), sec))
 	}
 	tr.AccessToken = strings.TrimSpace(tr.AccessToken)
-	if tr.AccessToken == "" {
-		return nil, false, errors.New("broker returned empty access_token")
+	if tr.AccessToken == "" || len(tr.AccessToken) > maxTokenLen || !isPrintableASCIINoSpace(tr.AccessToken) {
+		return nil, false, errors.New("broker returned invalid access_token")
+	}
+	if tr.BaseURL != "" {
+		validBase, ok := ValidateRayNeoBaseURL(tr.BaseURL)
+		if !ok {
+			return nil, false, errors.New("broker returned untrusted base_url")
+		}
+		tr.BaseURL = validBase
 	}
 	tr.ETag = strings.TrimSpace(resp.Header.Get("ETag"))
 	if tr.TokenFP == "" {
@@ -198,7 +244,7 @@ func ApplyToConfig(cfg *config.Config, resp *TokenResponse) (changed bool) {
 
 	tok := strings.TrimSpace(resp.AccessToken)
 	tokenChanged := false
-	if tok != "" && cfg.Token != tok {
+	if tok != "" && len(tok) <= maxTokenLen && isPrintableASCIINoSpace(tok) && cfg.Token != tok {
 		cfg.Token = tok
 		tokenChanged = true
 		changed = true
@@ -215,7 +261,7 @@ func ApplyToConfig(cfg *config.Config, resp *TokenResponse) (changed bool) {
 	}
 
 	src := "broker"
-	if s := strings.TrimSpace(resp.Source); s != "" {
+	if s := strings.TrimSpace(resp.Source); s != "" && !hasControlChars(s) {
 		if strings.HasPrefix(s, "broker:") || s == "broker" {
 			src = s
 		} else {
@@ -231,13 +277,13 @@ func ApplyToConfig(cfg *config.Config, resp *TokenResponse) (changed bool) {
 	if ts == "" {
 		ts = strings.TrimSpace(resp.CapturedAt)
 	}
-	if ts != "" && cfg.TokenTime != ts {
+	if ts != "" && !hasControlChars(ts) && cfg.TokenTime != ts {
 		cfg.TokenTime = ts
 		changed = true
 	}
 
 	exp := strings.TrimSpace(resp.ExpiresAt)
-	if exp != "" {
+	if exp != "" && !hasControlChars(exp) {
 		if cfg.TokenExpiresAt != exp {
 			cfg.TokenExpiresAt = exp
 			changed = true
@@ -247,31 +293,40 @@ func ApplyToConfig(cfg *config.Config, resp *TokenResponse) (changed bool) {
 		changed = true
 	}
 
-	if etag := strings.TrimSpace(resp.ETag); etag != "" && cfg.BrokerETag != etag {
+	if etag := strings.TrimSpace(resp.ETag); etag != "" && !hasControlChars(etag) && cfg.BrokerETag != etag {
 		cfg.BrokerETag = etag
 		changed = true
 	}
 
-	if base := strings.TrimRight(strings.TrimSpace(resp.BaseURL), "/"); base != "" && cfg.BaseURL != base {
-		cfg.BaseURL = base
+	// Defense-in-depth: never apply an untrusted base_url from a broker.
+	if validBase, ok := ValidateRayNeoBaseURL(resp.BaseURL); ok && validBase != "" && cfg.BaseURL != validBase {
+		cfg.BaseURL = validBase
 		changed = true
 	}
-	if reg := strings.TrimSpace(resp.Region); reg != "" && cfg.Region != reg {
+	if reg := strings.TrimSpace(resp.Region); reg != "" && !hasControlChars(reg) && cfg.Region != reg {
 		cfg.Region = reg
 		changed = true
 	}
-	if resp.AccountID != 0 && cfg.AccountID != resp.AccountID {
-		if cfg.AccountID != 0 && strings.TrimSpace(resp.Account) == "" && cfg.Account != "" {
-			cfg.Account = ""
+	if resp.AccountID > 0 && cfg.AccountID != resp.AccountID {
+		if cfg.AccountID != 0 {
+			if strings.TrimSpace(resp.Account) == "" && cfg.Account != "" {
+				cfg.Account = ""
+			}
+			if strings.TrimSpace(resp.DeviceID) == "" && cfg.DeviceID != "" {
+				cfg.DeviceID = ""
+			}
+			if len(cfg.ClientHeaders) > 0 {
+				cfg.ClientHeaders = nil
+			}
 		}
 		cfg.AccountID = resp.AccountID
 		changed = true
 	}
-	if acct := strings.TrimSpace(resp.Account); acct != "" && cfg.Account != acct {
+	if acct := strings.TrimSpace(resp.Account); acct != "" && !hasControlChars(acct) && cfg.Account != acct {
 		cfg.Account = acct
 		changed = true
 	}
-	if dev := strings.TrimSpace(resp.DeviceID); dev != "" && cfg.DeviceID != dev {
+	if dev := strings.TrimSpace(resp.DeviceID); dev != "" && !hasControlChars(dev) && cfg.DeviceID != dev {
 		cfg.DeviceID = dev
 		changed = true
 	}
@@ -293,7 +348,7 @@ func ApplyToConfig(cfg *config.Config, resp *TokenResponse) (changed bool) {
 }
 
 // FilterClientHeaders returns a new map containing only lowercase allowlisted
-// client headers with non-empty values.
+// client headers with safe non-empty values.
 func FilterClientHeaders(in map[string]string) map[string]string {
 	if len(in) == 0 {
 		return nil
@@ -302,7 +357,7 @@ func FilterClientHeaders(in map[string]string) map[string]string {
 	for k, v := range in {
 		lk := strings.ToLower(strings.TrimSpace(k))
 		lv := strings.TrimSpace(v)
-		if allowedClientHeaders[lk] && lv != "" {
+		if allowedClientHeaders[lk] && lv != "" && len(lv) <= maxHeaderValLen && !hasControlChars(lv) {
 			out[lk] = lv
 		}
 	}
@@ -342,6 +397,24 @@ func ParseExpiry(expiresAt string, now time.Time) (expired bool, remaining time.
 		return true, 0, true
 	}
 	return false, rem, true
+}
+
+func hasControlChars(s string) bool {
+	for _, r := range s {
+		if r < 0x20 || (r >= 0x7f && r <= 0x9f) {
+			return true
+		}
+	}
+	return false
+}
+
+func isPrintableASCIINoSpace(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < 0x21 || s[i] > 0x7e {
+			return false
+		}
+	}
+	return true
 }
 
 func extractBrokerError(body []byte) string {

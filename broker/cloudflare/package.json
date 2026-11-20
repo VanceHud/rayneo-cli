@@ -12,7 +12,7 @@
     ],
     "bindings": {
       "BROKER_SECRET": {
-        "description": "Shared Bearer secret for iOS Loon and `rayneo sync`. Generate a strong random value with `openssl rand -hex 32`."
+        "description": "Shared Bearer secret (>=32 chars) for iOS Loon and `rayneo sync`. Generate with `openssl rand -hex 32`. Optional `BROKER_READ_SECRET` / `BROKER_WRITE_SECRET` / `BROKER_ENCRYPTION_KEY` can also be added after deploy."
       }
     }
   },

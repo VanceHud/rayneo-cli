@@ -215,7 +215,7 @@ func TestSyncCommandLifecycle(t *testing.T) {
 			"expires_estimated": false,
 			"expired":           false,
 			"remaining_seconds": 5400,
-			"base_url":          apiSrv.URL,
+			"base_url":          "",
 			"region":            "cn",
 			"account_id":        54321,
 			"device_id":         "device-from-broker",
@@ -227,11 +227,12 @@ func TestSyncCommandLifecycle(t *testing.T) {
 	}))
 	defer brokerSrv.Close()
 
-	// Seed pre-existing config with a stale refresh token to confirm sync wipes it.
+	// Seed pre-existing config with mock API URL and a stale refresh token to confirm sync wipes it.
 	seed, err := config.Load()
 	if err != nil {
 		t.Fatal(err)
 	}
+	seed.BaseURL = apiSrv.URL
 	seed.RefreshToken = "stale_rt_should_disappear"
 	seed.NoRefresh = false
 	if err := seed.Save(); err != nil {

@@ -10,24 +10,48 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 const (
 	serviceName    = "rayneo-token-broker"
 	serviceVersion = "1"
 
-	maxBodyBytes     = 64 * 1024
-	maxTokenLen      = 512
-	maxSourceLen     = 64
-	maxHeaderValLen  = 1024
-	defaultTTLSecond = 7200
-	maxTTLSecond     = 86400
+	maxBodyBytes            = 64 * 1024
+	maxTokenLen             = 512
+	maxSourceLen            = 64
+	maxHeaderValLen         = 1024
+	minSecretLen            = 32
+	defaultTTLSecond        = 7200
+	maxTTLSecond            = 86400
+	expiredPurgeGrace       = 24 * time.Hour
+	maxCapturedAtFutureSkew = 24 * time.Hour
+	minRFC3339Year          = 2000
+	maxRFC3339Year          = 2100
 )
+
+var rayNeoAPIHostRe = regexp.MustCompile(`(?i)^xr-api-[a-z0-9-]+\.rayneo\.(cn|com)$`)
+
+var forbiddenSecrets = map[string]bool{
+	"replace-with-your-random-secret": true,
+	"your-strong-random-secret":       true,
+	"your-broker-secret":              true,
+	"your-secret":                     true,
+	"changeme":                        true,
+	"change-me":                       true,
+	"placeholder":                     true,
+	"default":                         true,
+	"example":                         true,
+	"password":                        true,
+	"secret":                          true,
+}
 
 // allowedClientHeaders mirrors internal/har/har.go exactly (15 safe headers).
 // Never include xtcl-*, authorization, host, content-*, accept-encoding, or cookie.
@@ -47,6 +71,56 @@ var allowedClientHeaders = map[string]bool{
 	"deviceid":         true,
 	"device_id":        true,
 	"device-code":      true,
+}
+
+// SecretSet configures backward-compatible full-access BROKER_SECRET alongside
+// optional least-privilege BROKER_READ_SECRET (GET) and BROKER_WRITE_SECRET (POST/DELETE).
+type SecretSet struct {
+	Shared string
+	Read   string
+	Write  string
+}
+
+func (s SecretSet) normalized() SecretSet {
+	return SecretSet{
+		Shared: strings.TrimSpace(s.Shared),
+		Read:   strings.TrimSpace(s.Read),
+		Write:  strings.TrimSpace(s.Write),
+	}
+}
+
+// Validate reports whether at least one secret is configured and every configured
+// secret meets minimum entropy / non-placeholder requirements.
+func (s SecretSet) Validate() (ok bool, reason string) {
+	n := s.normalized()
+	if n.Shared == "" && n.Read == "" && n.Write == "" {
+		return false, "unconfigured_secret"
+	}
+	if (n.Shared != "" && !isStrongSecret(n.Shared)) ||
+		(n.Read != "" && !isStrongSecret(n.Read)) ||
+		(n.Write != "" && !isStrongSecret(n.Write)) {
+		return false, "weak_or_placeholder_secret"
+	}
+	return true, ""
+}
+
+func isStrongSecret(raw string) bool {
+	s := strings.TrimSpace(raw)
+	if len(s) < minSecretLen || hasControlChars(s) {
+		return false
+	}
+	lower := strings.ToLower(s)
+	if forbiddenSecrets[lower] || strings.Contains(lower, "replace-with") {
+		return false
+	}
+	distinct := make(map[rune]struct{}, 4)
+	for _, r := range s {
+		distinct[r] = struct{}{}
+		if len(distinct) >= 4 {
+			return true
+		}
+	}
+	return false
 }
 
 // TokenState is the persisted single-slot access-token mirror state.
@@ -167,6 +241,11 @@ func (s *Store) loadLocked() error {
 	if loaded.TokenFP == "" {
 		loaded.TokenFP = tokenFingerprint(loaded.AccessToken)
 	}
+	if base, ok := validateRayNeoBaseURL(loaded.BaseURL); ok {
+		loaded.BaseURL = base
+	} else {
+		loaded.BaseURL = ""
+	}
 	loaded.ClientHeaders = filterClientHeaders(loaded.ClientHeaders)
 	s.state = &loaded
 	return nil
@@ -224,11 +303,48 @@ func (s *Store) persistLocked(st *TokenState) error {
 	return nil
 }
 
+func isPastPurgeGrace(expiresAtStr string, now time.Time) bool {
+	exp, err := parseRFC3339(expiresAtStr)
+	if err != nil {
+		return true
+	}
+	return !now.UTC().Before(exp.Add(expiredPurgeGrace))
+}
+
 // Get returns a defensive copy of the current token state, or nil if unset.
 func (s *Store) Get() *TokenState {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.state.clone()
+}
+
+// GetActive returns the current token state, automatically purging and returning nil
+// if the token has passed the 24h post-expiry grace window.
+func (s *Store) GetActive(now time.Time) (*TokenState, bool) {
+	s.mu.RLock()
+	st := s.state
+	if st == nil {
+		s.mu.RUnlock()
+		return nil, false
+	}
+	if !isPastPurgeGrace(st.ExpiresAt, now) {
+		cp := st.clone()
+		s.mu.RUnlock()
+		return cp, false
+	}
+	s.mu.RUnlock()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.state == nil {
+		return nil, false
+	}
+	if !isPastPurgeGrace(s.state.ExpiresAt, now) {
+		return s.state.clone(), false
+	}
+	_ = s.persistLocked(nil)
+	s.state = nil
+	return nil, true
 }
 
 // Clear removes stored token state from memory and disk.
@@ -245,21 +361,27 @@ func (s *Store) Clear() error {
 // Upsert validates, merges, and persists an incoming token payload atomically.
 func (s *Store) Upsert(req postTokenRequest, now time.Time) (postTokenResponse, int, string, error) {
 	accessToken := strings.TrimSpace(req.AccessToken)
-	if len(accessToken) < 1 || len(accessToken) > maxTokenLen || hasControlChars(accessToken) {
+	if len(accessToken) < 1 || len(accessToken) > maxTokenLen || !isPrintableASCIINoSpace(accessToken) {
 		return postTokenResponse{}, http.StatusBadRequest, "access_token is required (1..512 chars)", nil
 	}
+
+	nowUTC := now.UTC().Truncate(time.Second)
 
 	var normalizedCapturedAt string
 	if rawCap := strings.TrimSpace(req.CapturedAt); rawCap != "" {
 		parsed, err := parseRFC3339(rawCap)
-		if err != nil {
+		if err != nil || parsed.After(nowUTC.Add(maxCapturedAtFutureSkew)) {
 			return postTokenResponse{}, http.StatusBadRequest, "invalid captured_at (expected RFC3339)", nil
 		}
 		normalizedCapturedAt = formatUTCSeconds(parsed)
 	}
 
+	baseURL, baseOK := validateRayNeoBaseURL(req.BaseURL)
+	if !baseOK {
+		return postTokenResponse{}, http.StatusBadRequest, "invalid base_url", nil
+	}
+
 	source := sanitizeShortString(req.Source, maxSourceLen)
-	baseURL := strings.TrimRight(sanitizeShortString(req.BaseURL, 256), "/")
 	region := sanitizeShortString(req.Region, 64)
 	account := sanitizeShortString(req.Account, 256)
 	deviceID := sanitizeShortString(req.DeviceID, 256)
@@ -277,7 +399,6 @@ func (s *Store) Upsert(req postTokenRequest, now time.Time) (postTokenResponse, 
 		expiresIn = maxTTLSecond
 	}
 
-	nowUTC := now.UTC().Truncate(time.Second)
 	nowStr := nowUTC.Format(time.RFC3339)
 	fp := tokenFingerprint(accessToken)
 
@@ -285,7 +406,28 @@ func (s *Store) Upsert(req postTokenRequest, now time.Time) (postTokenResponse, 
 	defer s.mu.Unlock()
 
 	existing := s.state
+	if existing != nil && isPastPurgeGrace(existing.ExpiresAt, nowUTC) {
+		existing = nil
+	}
 	isNewToken := existing == nil || existing.AccessToken != accessToken
+
+	// Anti-downgrade guard: reject out-of-order stale non-authoritative captures
+	// (e.g., an in-flight loon:header with an older token arriving after loon:refresh).
+	if isNewToken && existing != nil && !isAuthoritativeSource(source) && normalizedCapturedAt != "" {
+		inCap, errIn := parseRFC3339(normalizedCapturedAt)
+		exCap, errEx := parseRFC3339(existing.CapturedAt)
+		if errIn == nil && errEx == nil && inCap.Before(exCap) {
+			return postTokenResponse{
+				OK:               true,
+				Updated:          false,
+				Revision:         existing.Revision,
+				TokenFP:          existing.TokenFP,
+				UpdatedAt:        existing.UpdatedAt,
+				ExpiresAt:        existing.ExpiresAt,
+				ExpiresEstimated: existing.ExpiresEstimated,
+			}, http.StatusOK, "", nil
+		}
+	}
 
 	next := &TokenState{
 		ClientHeaders: map[string]string{},
@@ -295,6 +437,16 @@ func (s *Store) Upsert(req postTokenRequest, now time.Time) (postTokenResponse, 
 	}
 
 	changed := false
+
+	// Cross-account switch: reset stale PII/device metadata before applying incoming fields.
+	if accountID > 0 && existing != nil && existing.AccountID > 0 && existing.AccountID != accountID {
+		if next.Account != "" || next.DeviceID != "" || len(next.ClientHeaders) > 0 {
+			next.Account = ""
+			next.DeviceID = ""
+			next.ClientHeaders = map[string]string{}
+			changed = true
+		}
+	}
 
 	if isNewToken {
 		changed = true
@@ -400,30 +552,68 @@ func (s *Store) Upsert(req postTokenRequest, now time.Time) (postTokenResponse, 
 
 // Broker implements the V1 Token Broker HTTP API.
 type Broker struct {
-	secret string
-	store  *Store
-	now    func() time.Time
-	logger *log.Logger
+	secrets      SecretSet
+	requireHTTPS bool
+	store        *Store
+	now          func() time.Time
+	logger       *log.Logger
 }
 
-// NewBroker constructs a Broker http.Handler.
+// NewBroker constructs a Broker http.Handler with a single full-access secret (backward compatible).
 func NewBroker(store *Store, secret string, logger *log.Logger) *Broker {
+	return NewBrokerWithSecrets(store, SecretSet{Shared: secret}, logger)
+}
+
+// NewBrokerWithSecrets constructs a Broker supporting optional read/write secret separation.
+func NewBrokerWithSecrets(store *Store, secrets SecretSet, logger *log.Logger) *Broker {
 	if logger == nil {
 		logger = log.New(io.Discard, "", 0)
 	}
 	return &Broker{
-		secret: strings.TrimSpace(secret),
-		store:  store,
-		now:    time.Now,
-		logger: logger,
+		secrets: secrets.normalized(),
+		store:   store,
+		now:     time.Now,
+		logger:  logger,
+	}
+}
+
+func isHTTPSRequest(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
+	}
+	if strings.EqualFold(r.URL.Scheme, "https") {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https")
+}
+
+func setSecurityHeaders(w http.ResponseWriter, isHTTPS bool) {
+	h := w.Header()
+	h.Set("Cache-Control", "no-store")
+	h.Set("X-Content-Type-Options", "nosniff")
+	h.Set("Referrer-Policy", "no-referrer")
+	h.Set("X-Frame-Options", "DENY")
+	h.Set("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
+	h.Set("Vary", "Authorization")
+	if isHTTPS {
+		h.Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
 	}
 }
 
 func (b *Broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
+	https := isHTTPSRequest(r)
+	setSecurityHeaders(w, https)
 
 	path := r.URL.Path
+
+	if b.requireHTTPS && !https {
+		b.logger.Printf("rejecting %s %s: status=426 reason=https_required", r.Method, path)
+		writeJSON(w, http.StatusUpgradeRequired, map[string]any{
+			"ok":    false,
+			"error": "https required",
+		})
+		return
+	}
 
 	if path == "/health" {
 		if r.Method != http.MethodGet {
@@ -435,23 +625,22 @@ func (b *Broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
-			"ok":      true,
-			"service": serviceName,
-			"version": serviceVersion,
+			"ok": true,
 		})
 		return
 	}
 
-	// All endpoints other than GET /health require configured BROKER_SECRET and Bearer auth.
-	if b.secret == "" {
-		b.logger.Printf("rejecting %s %s: status=503 reason=unconfigured_secret", r.Method, path)
+	// All endpoints other than GET /health require strong configured secret(s) and Bearer auth.
+	if ok, reason := b.secrets.Validate(); !ok {
+		b.logger.Printf("rejecting %s %s: status=503 reason=%s", r.Method, path, reason)
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
 			"ok":    false,
-			"error": "broker secret not configured",
+			"error": "service unavailable",
 		})
 		return
 	}
-	if !verifyBearerHeader(r.Header.Get("Authorization"), b.secret) {
+	canRead, canWrite, authed := authorizeBearerHeader(r.Header.Get("Authorization"), b.secrets)
+	if !authed {
 		w.Header().Set("WWW-Authenticate", `Bearer realm="rayneo-token-broker"`)
 		b.logger.Printf("rejecting %s %s: status=401 reason=unauthorized", r.Method, path)
 		writeJSON(w, http.StatusUnauthorized, map[string]any{
@@ -469,12 +658,45 @@ func (b *Broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if r.URL.RawQuery != "" {
+		b.logger.Printf("rejecting %s %s: status=400 reason=unexpected_query", r.Method, path)
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"ok":    false,
+			"error": "unexpected query parameters",
+		})
+		return
+	}
+
 	switch r.Method {
 	case http.MethodGet:
+		if !canRead {
+			b.logger.Printf("rejecting %s %s: status=403 reason=missing_read_scope", r.Method, path)
+			writeJSON(w, http.StatusForbidden, map[string]any{
+				"ok":    false,
+				"error": "forbidden",
+			})
+			return
+		}
 		b.handleGetToken(w, r)
 	case http.MethodPost:
+		if !canWrite {
+			b.logger.Printf("rejecting %s %s: status=403 reason=missing_write_scope", r.Method, path)
+			writeJSON(w, http.StatusForbidden, map[string]any{
+				"ok":    false,
+				"error": "forbidden",
+			})
+			return
+		}
 		b.handlePostToken(w, r)
 	case http.MethodDelete:
+		if !canWrite {
+			b.logger.Printf("rejecting %s %s: status=403 reason=missing_write_scope", r.Method, path)
+			writeJSON(w, http.StatusForbidden, map[string]any{
+				"ok":    false,
+				"error": "forbidden",
+			})
+			return
+		}
 		b.handleDeleteToken(w, r)
 	default:
 		w.Header().Set("Allow", "GET, POST, DELETE")
@@ -486,7 +708,11 @@ func (b *Broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (b *Broker) handleGetToken(w http.ResponseWriter, r *http.Request) {
-	st := b.store.Get()
+	now := b.now()
+	st, purged := b.store.GetActive(now)
+	if purged {
+		b.logger.Printf("GET /v1/token auto-purged expired token past 24h grace window")
+	}
 	if st == nil {
 		b.logger.Printf("GET /v1/token status=404")
 		writeJSON(w, http.StatusNotFound, map[string]any{
@@ -505,7 +731,7 @@ func (b *Broker) handleGetToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	expired, remaining := computeExpiry(st.ExpiresAt, b.now())
+	expired, remaining := computeExpiry(st.ExpiresAt, now)
 	headers := st.ClientHeaders
 	if headers == nil {
 		headers = map[string]string{}
@@ -533,7 +759,22 @@ func (b *Broker) handleGetToken(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func isJSONContentType(raw string) bool {
+	mediaType := strings.ToLower(strings.TrimSpace(strings.Split(raw, ";")[0]))
+	return mediaType == "application/json" || strings.HasSuffix(mediaType, "+json")
+}
+
 func (b *Broker) handlePostToken(w http.ResponseWriter, r *http.Request) {
+	ct := strings.TrimSpace(r.Header.Get("Content-Type"))
+	if ct != "" && !isJSONContentType(ct) {
+		b.logger.Printf("POST /v1/token status=415 reason=unsupported_media_type")
+		writeJSON(w, http.StatusUnsupportedMediaType, map[string]any{
+			"ok":    false,
+			"error": "content-type must be application/json",
+		})
+		return
+	}
+
 	limited := http.MaxBytesReader(w, r.Body, maxBodyBytes)
 	defer limited.Close()
 
@@ -556,11 +797,27 @@ func (b *Broker) handlePostToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !utf8.Valid(bodyBytes) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"ok":    false,
+			"error": "invalid utf-8 body",
+		})
+		return
+	}
+
 	trimmed := strings.TrimSpace(string(bodyBytes))
 	if len(trimmed) == 0 || trimmed[0] != '{' {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
 			"ok":    false,
 			"error": "invalid json body",
+		})
+		return
+	}
+	if ct == "" {
+		b.logger.Printf("POST /v1/token status=415 reason=missing_content_type")
+		writeJSON(w, http.StatusUnsupportedMediaType, map[string]any{
+			"ok":    false,
+			"error": "content-type must be application/json",
 		})
 		return
 	}
@@ -628,28 +885,46 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 	_ = json.NewEncoder(w).Encode(payload)
 }
 
-func verifyBearerHeader(authHeader, expectedSecret string) bool {
-	if expectedSecret == "" {
-		return false
-	}
+func extractBearerToken(authHeader string) (string, bool) {
 	h := strings.TrimSpace(authHeader)
 	spaceIdx := strings.IndexByte(h, ' ')
 	if spaceIdx <= 0 {
-		return false
+		return "", false
 	}
 	scheme := h[:spaceIdx]
 	if !strings.EqualFold(scheme, "Bearer") {
-		return false
+		return "", false
 	}
 	provided := strings.TrimSpace(h[spaceIdx+1:])
 	if provided == "" {
+		return "", false
+	}
+	return provided, true
+}
+
+func constantTimeSecretMatch(providedHash [32]byte, expectedSecret string) bool {
+	if expectedSecret == "" {
 		return false
 	}
-	// Hash both secrets to fixed 32-byte SHA-256 digests so length differences
-	// cannot leak via timing.
-	hProvided := sha256.Sum256([]byte(provided))
 	hExpected := sha256.Sum256([]byte(expectedSecret))
-	return subtle.ConstantTimeCompare(hProvided[:], hExpected[:]) == 1
+	return subtle.ConstantTimeCompare(providedHash[:], hExpected[:]) == 1
+}
+
+// authorizeBearerHeader evaluates all configured secret slots in constant time
+// without early exit so timing cannot reveal which slot matched.
+func authorizeBearerHeader(authHeader string, secrets SecretSet) (canRead, canWrite, authed bool) {
+	provided, ok := extractBearerToken(authHeader)
+	if !ok {
+		return false, false, false
+	}
+	hProvided := sha256.Sum256([]byte(provided))
+	matchShared := constantTimeSecretMatch(hProvided, secrets.Shared)
+	matchRead := constantTimeSecretMatch(hProvided, secrets.Read)
+	matchWrite := constantTimeSecretMatch(hProvided, secrets.Write)
+	if !matchShared && !matchRead && !matchWrite {
+		return false, false, false
+	}
+	return matchShared || matchRead, matchShared || matchWrite, true
 }
 
 func tokenFingerprint(token string) string {
@@ -687,6 +962,31 @@ func etagMatches(ifNoneMatch, currentETag string) bool {
 	return false
 }
 
+func validateRayNeoBaseURL(raw string) (string, bool) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", true
+	}
+	if len(trimmed) > 256 || hasControlChars(trimmed) {
+		return "", false
+	}
+	trimmed = strings.TrimRight(trimmed, "/")
+	u, err := url.Parse(trimmed)
+	if err != nil {
+		return "", false
+	}
+	if !strings.EqualFold(u.Scheme, "https") ||
+		u.User != nil ||
+		u.Port() != "" ||
+		(u.Path != "" && u.Path != "/") ||
+		u.RawQuery != "" ||
+		u.Fragment != "" ||
+		!rayNeoAPIHostRe.MatchString(u.Hostname()) {
+		return "", false
+	}
+	return "https://" + strings.ToLower(u.Hostname()), true
+}
+
 func filterClientHeaders(in map[string]string) map[string]string {
 	out := make(map[string]string)
 	for rawK, rawV := range in {
@@ -716,10 +1016,18 @@ func computeExpiry(expiresAtStr string, now time.Time) (expired bool, remainingS
 }
 
 func parseRFC3339(s string) (time.Time, error) {
-	if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
-		return t, nil
+	t, err := time.Parse(time.RFC3339Nano, s)
+	if err != nil {
+		t, err = time.Parse(time.RFC3339, s)
+		if err != nil {
+			return time.Time{}, err
+		}
 	}
-	return time.Parse(time.RFC3339, s)
+	utc := t.UTC()
+	if utc.Year() < minRFC3339Year || utc.Year() > maxRFC3339Year {
+		return time.Time{}, errors.New("timestamp year out of range")
+	}
+	return utc, nil
 }
 
 func formatUTCSeconds(t time.Time) string {
@@ -731,12 +1039,21 @@ func isAuthoritativeSource(src string) bool {
 }
 
 func hasControlChars(s string) bool {
-	for i := 0; i < len(s); i++ {
-		if s[i] < 0x20 || s[i] == 0x7f {
+	for _, r := range s {
+		if r < 0x20 || (r >= 0x7f && r <= 0x9f) {
 			return true
 		}
 	}
 	return false
+}
+
+func isPrintableASCIINoSpace(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < 0x21 || s[i] > 0x7e {
+			return false
+		}
+	}
+	return true
 }
 
 func sanitizeShortString(s string, maxLen int) string {
