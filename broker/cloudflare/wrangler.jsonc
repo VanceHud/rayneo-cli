@@ -13,12 +13,12 @@
       }
     ]
   },
-  "migrations": [
-    {
-      "tag": "v1",
-      "new_sqlite_classes": ["TokenBrokerDO"]
+  "exports": {
+    "TokenBrokerDO": {
+      "type": "durable-object",
+      "storage": "sqlite"
     }
-  ],
+  },
   "observability": {
     "enabled": true,
     "logs": {

@@ -47,7 +47,7 @@ Key behaviors:
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/VanceHud/rayneo-cli/tree/main/broker/cloudflare)
 
-Uses a SQLite-backed Durable Object (`TokenBrokerDO` with `new_sqlite_classes` in [`cloudflare/wrangler.jsonc`](./cloudflare/wrangler.jsonc)), which provides strong consistency on **both Cloudflare Workers Free and Paid plans**.
+Uses a SQLite-backed Durable Object (`TokenBrokerDO` declared via `exports` with `storage: "sqlite"` in [`cloudflare/wrangler.jsonc`](./cloudflare/wrangler.jsonc)), which provides strong consistency on **both Cloudflare Workers Free and Paid plans**.
 
 ### One-Click Deploy (Recommended)
 
