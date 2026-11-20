@@ -36,15 +36,17 @@ func printHelp() {
 	helpSpec.Version = effectiveVersion()
 	fmt.Printf("%s %s — %s\n\n", helpSpec.Name, helpSpec.Version, helpSpec.Description)
 	fmt.Printf("auth: %s\n\n", helpSpec.Auth)
+	fmt.Printf("safety: %s\n\n", helpSpec.Safety)
 	groups := []struct {
 		title string
 		names []string
 	}{
-		{"auth", []string{"sync", "har", "sendcode", "login", "refresh", "whoami", "logout", "config"}},
-		{"query (read-only)", []string{"count", "calendar", "events", "event", "journal", "jd", "suggests", "tasks", "chat"}},
+		{"auth (non-read-only except whoami; requires user permission)", []string{"sync", "har", "sendcode", "login", "refresh", "whoami", "logout", "config"}},
+		{"query (read-only)", []string{"count", "calendar", "events", "event", "journal", "jd", "trail", "digest", "suggests", "chat", "facts", "devices", "profile", "quota"}},
+		{"tasks (read-only list; write subcommands require user permission)", []string{"tasks"}},
 		{"transcripts (read-only)", []string{"full", "recordings", "transcript"}},
-		{"bulk", []string{"export", "report", "cache"}},
-		{"utility", []string{"raw", "help"}},
+		{"bulk (read-only / local cache)", []string{"export", "report", "cache"}},
+		{"utility (raw requires user permission for non-read-only requests)", []string{"raw", "help"}},
 	}
 	byName := map[string]cmdSpec{}
 	for _, c := range helpSpec.Commands {
@@ -57,7 +59,11 @@ func printHelp() {
 			if !ok {
 				continue
 			}
-			fmt.Printf("  %-10s %s\n", c.Name, c.Summary)
+			badge := ""
+			if !c.ReadOnly {
+				badge = "[NON-READ-ONLY · PERMISSION REQUIRED] "
+			}
+			fmt.Printf("  %-10s %s%s\n", c.Name, badge, c.Summary)
 			for _, a := range c.Args {
 				def := ""
 				if a.Default != "" {
@@ -490,7 +496,26 @@ func main() {
 		}
 	case "config":
 		cmdConfig(args)
-	case "count", "calendar", "events", "journal", "story", "journal-detail", "jd", "suggests", "tasks", "chat":
+	case "tasks", "task":
+		cmdTasks(args, debug)
+	case "chat":
+		cmdChat(args, debug)
+	case "trail":
+		cmdTrail(args, debug)
+	case "digest", "today":
+		if cmd == "today" {
+			args = append([]string{"-date", "today"}, args...)
+		}
+		cmdDigest(args, debug)
+	case "facts":
+		cmdFacts(args, debug)
+	case "devices":
+		cmdDevices(args, debug)
+	case "profile":
+		cmdProfile(args, debug)
+	case "quota", "balance":
+		cmdQuota(args, debug)
+	case "count", "calendar", "events", "journal", "story", "journal-detail", "jd", "suggests":
 		cmdQuery(cmd, args, debug)
 	case "raw":
 		cmdRaw(args, debug)
@@ -1155,30 +1180,21 @@ func cmdQuery(name string, args []string, debug bool) {
 		callBody(cl, "POST", "/lifelog/api/v1/calendar", q, payload)
 	case "events":
 		if *date != "" {
-			q.Set("date", *date)
+			q.Set("date", resolveDate(*date))
 		}
 		q.Set("timezone", *tz)
 		call(cl, "GET", "/lifelog/api/v1/events", q)
 	case "journal", "story":
 		if *date != "" {
-			q.Set("date", *date)
+			q.Set("date", resolveDate(*date))
 		}
 		call(cl, "GET", "/lifelog/api/v1/journal/latest", q)
 	case "journal-detail", "jd":
-		if *date == "" {
-			*date = time.Now().Format("2006-01-02")
-		}
+		day := resolveDate(*date)
 		callBody(cl, "POST", "/lifelog/api/v1/journal/detail", q,
-			map[string]any{"journalDate": *date})
+			map[string]any{"journalDate": day})
 	case "suggests":
 		callBody(cl, "POST", "/summary-service/suggest/list", q, map[string]any{})
-	case "tasks":
-		q.Set("accountId", fmt.Sprintf("%d", c.AccountID))
-		q.Set("sources", "rayneoTasks")
-		call(cl, "GET", "/action/api/v2/tasks", q)
-	case "chat":
-		q.Set("pageSize", "30")
-		call(cl, "GET", "/clsapi/aiChat/selectPage", q)
 	}
 }
 
@@ -1247,10 +1263,11 @@ func cmdRaw(args []string, debug bool) {
 
 func cmdExport(args []string, debug bool) {
 	fs := flag.NewFlagSet("export", flag.ExitOnError)
-	from := fs.String("from", "", "YYYY-MM-DD")
-	to := fs.String("to", "", "YYYY-MM-DD")
+	from := fs.String("from", "", "YYYY-MM-DD, today, yesterday, or -Nd")
+	to := fs.String("to", "", "YYYY-MM-DD, today, yesterday, or -Nd")
 	out := fs.String("out", "rayneo-export", "output dir")
 	format := fs.String("format", "all", "json|csv|md|all")
+	tz := fs.String("tz", "Asia/Shanghai", "timezone")
 	_ = fs.Parse(args)
 	if *from == "" || *to == "" {
 		fmt.Fprintln(os.Stderr, "-from and -to are required")
@@ -1264,11 +1281,11 @@ func cmdExport(args []string, debug bool) {
 
 	c := mustConfig()
 	cl := newClient(c, debug, nil)
-	days := dayRange(*from, *to)
-	fmt.Printf("exporting %d day(s) -> %s (format=%s)\n", len(days), *out, *format)
+	days := dayRange(resolveDate(*from), resolveDate(*to))
+	fmt.Printf("exporting %d day(s) -> %s (format=%s, tz=%s)\n", len(days), *out, *format, *tz)
 
 	for _, d := range days {
-		q := url.Values{"date": {d}, "timezone": {"Asia/Shanghai"}}
+		q := url.Values{"date": {d}, "timezone": {*tz}}
 		_, body, err := callWithAuth(cl, "GET", "/lifelog/api/v1/events", q, nil)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "events %s: %v\n", d, err)
@@ -1310,13 +1327,22 @@ func cmdExport(args []string, debug bool) {
 }
 
 func cmdFull(args []string, debug bool) {
-	fs := flag.NewFlagSet("full", flag.ExitOnError)
+	if code := runFull(args, debug, os.Stdout, os.Stderr); code != 0 {
+		os.Exit(code)
+	}
+}
+
+func runFull(args []string, debug bool, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("full", flag.ContinueOnError)
+	fs.SetOutput(stderr)
 	id := fs.String("id", "", "event id")
-	date := fs.String("date", "", "YYYY-MM-DD: all events of that day")
+	date := fs.String("date", "", "YYYY-MM-DD (or today/yesterday/-Nd): all events of that day")
 	format := fs.String("format", "md", "md|txt|srt|json")
 	out := fs.String("out", "", "write files into this dir")
 	tz := fs.String("tz", "Asia/Shanghai", "timezone for -date")
-	_ = fs.Parse(args)
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
 
 	cl := newClient(mustConfig(), debug, nil)
 	var ids []string
@@ -1325,14 +1351,15 @@ func cmdFull(args []string, debug bool) {
 	case *id != "":
 		ids = []string{*id}
 	case *date != "":
-		q := url.Values{"date": {*date}, "timezone": {*tz}}
+		day := resolveDate(*date)
+		q := url.Values{"date": {day}, "timezone": {*tz}}
 		_, body, err := callWithAuth(cl, "GET", "/lifelog/api/v1/events", q, nil)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
+			fmt.Fprintln(stderr, err)
+			return 1
 		}
 		if authExpired(body) {
-			os.Exit(1)
+			return 1
 		}
 		var r struct {
 			Data struct {
@@ -1349,8 +1376,8 @@ func cmdFull(args []string, debug bool) {
 			labels[eid] = sanitize(asString(e["title"]))
 		}
 	default:
-		fmt.Fprintln(os.Stderr, "need -id <eventId> or -date YYYY-MM-DD")
-		os.Exit(2)
+		fmt.Fprintln(stderr, "need -id <eventId> or -date YYYY-MM-DD")
+		return 2
 	}
 
 	total := 0
@@ -1366,12 +1393,26 @@ func cmdFull(args []string, debug bool) {
 				if *out != "" {
 					name := sanitize(fmt.Sprintf("rec_%d_%s", tb.AITask.CreateTime, tb.AITask.Name))
 					if err := writeTranscriptDir(*out, tb, name); err == nil {
-						fmt.Printf("  %s  %4d 段  %s (recording)\n", eid, len(tb.Recording.Clips), name)
+						fmt.Fprintf(stdout, "  %s  %4d 段  %s (recording)\n", eid, len(tb.Recording.Clips), name)
+					} else {
+						fmt.Fprintln(stderr, err)
 					}
+					continue
+				}
+				switch *format {
+				case "txt":
+					fmt.Fprint(stdout, tb.Text())
+				case "srt":
+					fmt.Fprint(stdout, tb.SRT())
+				case "json":
+					j, _ := json.MarshalIndent(tb, "", "  ")
+					fmt.Fprintln(stdout, string(j))
+				default:
+					fmt.Fprint(stdout, tb.Markdown())
 				}
 				continue
 			}
-			fmt.Fprintf(os.Stderr, "  %s: %v\n", eid, err)
+			fmt.Fprintf(stderr, "  %s: %v\n", eid, err)
 			continue
 		}
 		total += f.allClips()
@@ -1382,27 +1423,28 @@ func cmdFull(args []string, debug bool) {
 			}
 			name := sanitize(fmt.Sprintf("%s_%s_%s", strings.ReplaceAll(f.StartTimeFormatted, ":", ""), shortID, firstNonEmpty(labels[eid], f.Title)))
 			if err := writeFullDir(*out, f, name); err != nil {
-				fmt.Fprintln(os.Stderr, err)
+				fmt.Fprintln(stderr, err)
 				continue
 			}
-			fmt.Printf("  %s  %4d 段  %s\n", eid, f.allClips(), name)
+			fmt.Fprintf(stdout, "  %s  %4d 段  %s\n", eid, f.allClips(), name)
 			continue
 		}
 		switch *format {
 		case "txt":
-			fmt.Print(f.Text())
+			fmt.Fprint(stdout, f.Text())
 		case "srt":
-			fmt.Print(f.SRT())
+			fmt.Fprint(stdout, f.SRT())
 		case "json":
 			j, _ := json.MarshalIndent(f, "", "  ")
-			fmt.Println(string(j))
+			fmt.Fprintln(stdout, string(j))
 		default:
-			fmt.Print(f.Markdown())
+			fmt.Fprint(stdout, f.Markdown())
 		}
 	}
 	if *out != "" {
-		fmt.Printf("\n共 %d 个事件 / %d 段转录\n", len(ids), total)
+		fmt.Fprintf(stdout, "\n共 %d 个事件 / %d 段转录\n", len(ids), total)
 	}
+	return 0
 }
 
 func firstNonEmpty(vals ...string) string {
@@ -1493,26 +1535,51 @@ func cmdEvent(args []string, debug bool) {
 }
 
 func cmdRecordings(args []string, debug bool) {
-	fs := flag.NewFlagSet("recordings", flag.ExitOnError)
-	typ := fs.String("type", "recording", "taskType: recording|cc|'' for all")
-	n := fs.Int("n", 50, "page size")
-	_ = fs.Parse(args)
-	cl := newClient(mustConfig(), debug, nil)
-	rows, err := listAITasks(cl, *typ, *n)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+	if code := runRecordings(args, debug, os.Stdout, os.Stderr); code != 0 {
+		os.Exit(code)
 	}
-	fmt.Printf("%-34s %-10s %-9s %-8s %s\n", "TASKID", "TYPE", "DURATION", "WHEN", "NAME")
+}
+
+func runRecordings(args []string, debug bool, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("recordings", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	typ := fs.String("type", "recording", "taskType: recording|cc|'' for all")
+	device := fs.String("device", "RayNeoS3", "deviceType filter ('' for all devices)")
+	n := fs.Int("n", 50, "page size")
+	deadline := fs.Int64("deadline", 0, "optional pagination cursor (epoch ms)")
+	all := fs.Bool("all", false, "paginate through all matching recordings")
+	jsonOut := fs.Bool("json", false, "print JSON output")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	cl := newClient(mustConfig(), debug, nil)
+	var rows []aiTaskRow
+	var err error
+	if *all {
+		rows, err = listAITasksAll(cl, *typ, *device, *n, *deadline)
+	} else {
+		rows, err = listAITasks(cl, *typ, *device, *n, *deadline)
+	}
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	if *jsonOut {
+		b, _ := json.MarshalIndent(rows, "", "  ")
+		fmt.Fprintln(stdout, string(b))
+		return 0
+	}
+	fmt.Fprintf(stdout, "%-34s %-10s %-9s %-11s %s\n", "TASKID", "TYPE", "DURATION", "WHEN", "NAME")
 	for _, r := range rows {
 		dur := ""
 		if r.DurationMs > 0 {
 			dur = fmt.Sprintf("%d:%02d", r.DurationMs/60000, (r.DurationMs/1000)%60)
 		}
 		when := time.UnixMilli(r.CreateTime).Format("01-02 15:04")
-		fmt.Printf("%-34s %-10s %-9s %-8s %s\n", r.TaskID, r.TaskType, dur, when, r.Name)
+		fmt.Fprintf(stdout, "%-34s %-10s %-9s %-11s %s\n", r.TaskID, r.TaskType, dur, when, r.Name)
 	}
-	fmt.Printf("\n共 %d 条\n", len(rows))
+	fmt.Fprintf(stdout, "\n共 %d 条\n", len(rows))
+	return 0
 }
 
 func cmdTranscript(args []string, debug bool) {
@@ -1533,7 +1600,8 @@ func cmdTranscript(args []string, debug bool) {
 	case *id != "":
 		ids = append(ids, *id)
 	case *date != "":
-		q := url.Values{"date": {*date}, "timezone": {*tz}}
+		day := resolveDate(*date)
+		q := url.Values{"date": {day}, "timezone": {*tz}}
 		_, body, err := callWithAuth(cl, "GET", "/lifelog/api/v1/events", q, nil)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -1627,6 +1695,9 @@ func cmdCache(args []string) {
 			os.Exit(1)
 		}
 		fmt.Println("cache cleared:", c.Dir)
+	case "prune":
+		removed, freed := c.Prune()
+		fmt.Printf("pruned %d stale cache file(s) (freed %.1f KB)\n", removed, float64(freed)/1024)
 	case "ls", "list":
 		for _, e := range c.List(20) {
 			age := time.Since(time.Unix(e.FetchedAt, 0)).Round(time.Second)
@@ -1646,7 +1717,7 @@ func cmdCache(args []string) {
 		fmt.Printf("dir   : %s\nfiles : %d (%.1f KB)\nfresh : %d\nstale : %d\n",
 			c.Dir, files, float64(bytes)/1024, fresh, stale)
 	default:
-		fmt.Fprintln(os.Stderr, "usage: rayneo cache [stat|ls|clear]")
+		fmt.Fprintln(os.Stderr, "usage: rayneo cache [stat|ls|prune|clear]")
 		os.Exit(2)
 	}
 }

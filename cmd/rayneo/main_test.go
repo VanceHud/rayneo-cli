@@ -565,17 +565,27 @@ func TestVersionAndHelpSpec(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal helpSpec: %v", err)
 	}
-	if len(helpSpec.Commands) != 25 || len(b) == 0 {
+	if len(helpSpec.Commands) != 31 || len(b) == 0 {
 		t.Fatalf("unexpected helpSpec command count: %d", len(helpSpec.Commands))
 	}
-	foundSync := false
+	wantCmds := map[string]bool{
+		"sync": false, "trail": false, "digest": false,
+		"facts": false, "devices": false, "profile": false, "quota": false, "tasks": false,
+	}
 	for _, c := range helpSpec.Commands {
-		if c.Name == "sync" {
-			foundSync = true
-			break
+		if _, ok := wantCmds[c.Name]; ok {
+			wantCmds[c.Name] = true
+		}
+		if !c.ReadOnly && !c.RequiresConfirmation {
+			t.Errorf("non-read-only command %q must set RequiresConfirmation=true", c.Name)
 		}
 	}
-	if !foundSync {
-		t.Fatalf("expected sync subcommand in helpSpec")
+	if helpSpec.Safety == "" {
+		t.Fatalf("expected non-empty helpSpec.Safety permission rule")
+	}
+	for name, seen := range wantCmds {
+		if !seen {
+			t.Fatalf("expected %q subcommand in helpSpec", name)
+		}
 	}
 }

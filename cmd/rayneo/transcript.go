@@ -61,16 +61,24 @@ type transcriptBundle struct {
 
 // ---------- fetch ----------
 
-// listAITasks returns transcription tasks (taskType recording/cc/…).
-func listAITasks(cl *api.Client, taskType string, pageSize int) ([]aiTaskRow, error) {
+// listAITasks returns one page of transcription tasks (taskType recording/cc/…).
+// deviceType defaults to "RayNeoS3" when passed as non-empty; empty string sends null (all devices).
+// deadline <= 0 uses 9999999999999 (latest page).
+func listAITasks(cl *api.Client, taskType, deviceType string, pageSize int, deadline int64) ([]aiTaskRow, error) {
+	if deadline <= 0 {
+		deadline = 9999999999999
+	}
 	payload := map[string]any{
-		"deviceType":    "RayNeoS3",
+		"deviceType":    nil,
 		"taskIds":       nil,
 		"phoneDeviceId": nil,
 		"taskType":      nil,
 		"name":          nil,
-		"deadline":      9999999999999,
+		"deadline":      deadline,
 		"pageSize":      pageSize,
+	}
+	if deviceType != "" {
+		payload["deviceType"] = deviceType
 	}
 	if taskType != "" {
 		payload["taskType"] = taskType
@@ -78,6 +86,9 @@ func listAITasks(cl *api.Client, taskType string, pageSize int) ([]aiTaskRow, er
 	_, body, err := callWithAuth(cl, "POST", "/clsapi/aiTask/v2/selectPage", nil, payload)
 	if err != nil {
 		return nil, err
+	}
+	if authExpired(body) {
+		return nil, fmt.Errorf("authentication expired")
 	}
 	var r struct {
 		Code int    `json:"code"`
@@ -93,6 +104,49 @@ func listAITasks(cl *api.Client, taskType string, pageSize int) ([]aiTaskRow, er
 		return nil, fmt.Errorf("code=%d msg=%s", r.Code, r.Msg)
 	}
 	return r.Data.PageList, nil
+}
+
+// listAITasksAll paginates through /clsapi/aiTask/v2/selectPage using createTime as deadline cursor.
+func listAITasksAll(cl *api.Client, taskType, deviceType string, pageSize int, startDeadline int64) ([]aiTaskRow, error) {
+	if pageSize <= 0 {
+		pageSize = 50
+	}
+	cursor := startDeadline
+	seen := map[string]bool{}
+	var all []aiTaskRow
+	for page := 0; page < 50; page++ {
+		if page > 0 {
+			time.Sleep(300 * time.Millisecond)
+		}
+		rows, err := listAITasks(cl, taskType, deviceType, pageSize, cursor)
+		if err != nil {
+			if len(all) > 0 {
+				return all, err
+			}
+			return nil, err
+		}
+		if len(rows) == 0 {
+			break
+		}
+		added := 0
+		var minTS int64
+		for _, row := range rows {
+			if row.CreateTime > 0 && (minTS == 0 || row.CreateTime < minTS) {
+				minTS = row.CreateTime
+			}
+			if seen[row.TaskID] {
+				continue
+			}
+			seen[row.TaskID] = true
+			all = append(all, row)
+			added++
+		}
+		if len(rows) < pageSize || added == 0 || minTS <= 1 {
+			break
+		}
+		cursor = minTS - 1
+	}
+	return all, nil
 }
 
 // fetchTranscript pulls the full transcript for one taskId.
@@ -182,7 +236,73 @@ func (b *transcriptBundle) SRT() string {
 	return sb.String()
 }
 
-// Markdown renders a readable transcript with metadata and speakers.
+type recordingMark struct {
+	MarkTime any    `json:"markTime"`
+	MarkID   string `json:"markId"`
+	Remarks  []struct {
+		Hashtag *string `json:"hashtag"`
+		Remark  string  `json:"remark"`
+	} `json:"remarks"`
+}
+
+type recordingOutlineItem struct {
+	Offset    any    `json:"offset"`
+	Title     string `json:"title"`
+	Timestamp any    `json:"timestamp"`
+	Subtitle  string `json:"subtitle"`
+}
+
+type mindMapNode struct {
+	Title    string        `json:"title"`
+	Children []mindMapNode `json:"children"`
+}
+
+type summaryItem struct {
+	Name    string `json:"name"`
+	Model   string `json:"model"`
+	Content struct {
+		Content string       `json:"content"`
+		MindMap *mindMapNode `json:"mindMap"`
+	} `json:"content"`
+}
+
+func sanitizeMindMapLabel(s string) string {
+	s = strings.TrimSpace(s)
+	replacer := strings.NewReplacer(
+		"\r\n", " ",
+		"\n", " ",
+		"\r", " ",
+		"(", "（",
+		")", "）",
+		"[", "【",
+		"]", "】",
+		"{", "｛",
+		"}", "｝",
+		"\"", "'",
+	)
+	return replacer.Replace(s)
+}
+
+func writeMindMapMermaid(sb *strings.Builder, node *mindMapNode, depth int) {
+	if node == nil {
+		return
+	}
+	label := sanitizeMindMapLabel(node.Title)
+	if label == "" {
+		label = "未命名节点"
+	}
+	indent := strings.Repeat("  ", depth+1)
+	if depth == 0 {
+		fmt.Fprintf(sb, "%sroot((%s))\n", indent, label)
+	} else {
+		fmt.Fprintf(sb, "%s%s\n", indent, label)
+	}
+	for i := range node.Children {
+		writeMindMapMermaid(sb, &node.Children[i], depth+1)
+	}
+}
+
+// Markdown renders a readable transcript with metadata, marks, outline, speakers, clips, summaries and mind maps.
 func (b *transcriptBundle) Markdown() string {
 	var sb strings.Builder
 	name := b.AITask.Name
@@ -221,24 +341,110 @@ func (b *transcriptBundle) Markdown() string {
 		fmt.Fprintf(&sb, "**说话人** %s\n\n", strings.Join(parts, ", "))
 	}
 
-	sb.WriteString("## 转录\n\n")
 	t0 := b.t0()
+
+	// recording marks (glasses highlight markers)
+	if len(b.Recording.Marks) > 0 && string(b.Recording.Marks) != "null" {
+		var marks []recordingMark
+		if json.Unmarshal(b.Recording.Marks, &marks) == nil && len(marks) > 0 {
+			fmt.Fprintf(&sb, "## 重点打点（%d）\n\n", len(marks))
+			for _, m := range marks {
+				mt := toInt64(m.MarkTime)
+				tsLabel := mmss(mt - t0)
+				if mt > 0 {
+					tsLabel = fmt.Sprintf("%s (%s)", mmss(mt-t0), time.UnixMilli(mt).Format("15:04:05"))
+				}
+				var notes []string
+				for _, rm := range m.Remarks {
+					var chunk []string
+					if rm.Hashtag != nil && strings.TrimSpace(*rm.Hashtag) != "" {
+						chunk = append(chunk, "#"+strings.TrimSpace(*rm.Hashtag))
+					}
+					if strings.TrimSpace(rm.Remark) != "" {
+						chunk = append(chunk, strings.TrimSpace(rm.Remark))
+					}
+					if len(chunk) > 0 {
+						notes = append(notes, strings.Join(chunk, " "))
+					}
+				}
+				if len(notes) > 0 {
+					fmt.Fprintf(&sb, "- `%s` %s\n", tsLabel, strings.Join(notes, "；"))
+				} else {
+					fmt.Fprintf(&sb, "- `%s` _（眼镜打点标记）_\n", tsLabel)
+				}
+			}
+			sb.WriteString("\n")
+		}
+	}
+
+	// recording outline
+	if len(b.Recording.Outline) > 0 && string(b.Recording.Outline) != "null" {
+		var outline []recordingOutlineItem
+		if json.Unmarshal(b.Recording.Outline, &outline) == nil && len(outline) > 0 {
+			fmt.Fprintf(&sb, "## 提纲（%d）\n\n", len(outline))
+			for _, o := range outline {
+				ts := toInt64(o.Timestamp)
+				if ts == 0 {
+					ts = toInt64(o.Offset)
+				}
+				prefix := ""
+				if ts > 0 {
+					if ts > 1_000_000_000_000 { // epoch ms
+						prefix = fmt.Sprintf("`%s` ", mmss(ts-t0))
+					} else {
+						prefix = fmt.Sprintf("`%s` ", mmss(ts))
+					}
+				}
+				text := strings.TrimSpace(o.Subtitle)
+				if strings.TrimSpace(o.Title) != "" {
+					if text != "" {
+						text = fmt.Sprintf("**%s**：%s", strings.TrimSpace(o.Title), text)
+					} else {
+						text = fmt.Sprintf("**%s**", strings.TrimSpace(o.Title))
+					}
+				}
+				if text != "" {
+					fmt.Fprintf(&sb, "- %s%s\n", prefix, text)
+				}
+			}
+			sb.WriteString("\n")
+		}
+	}
+
+	sb.WriteString("## 转录\n\n")
 	for _, c := range b.Recording.Clips {
 		fmt.Fprintf(&sb, "- `%s` **%s**：%s\n", mmss(c.StartTime-t0), c.SpeakerName, c.Content)
 		if c.TranslateContent != nil && *c.TranslateContent != "" {
 			fmt.Fprintf(&sb, "  - _%s_\n", *c.TranslateContent)
 		}
 	}
+
+	// summaries & mind maps
 	if len(b.Summary) > 0 && string(b.Summary) != "null" {
-		var arr []struct {
-			Content struct {
-				Content string `json:"content"`
-			} `json:"content"`
-		}
-		if json.Unmarshal(b.Summary, &arr) == nil && len(arr) > 0 && arr[0].Content.Content != "" {
-			sb.WriteString("\n## AI 摘要\n\n")
-			sb.WriteString(arr[0].Content.Content)
-			sb.WriteString("\n")
+		var arr []summaryItem
+		if json.Unmarshal(b.Summary, &arr) == nil && len(arr) > 0 {
+			for i, s := range arr {
+				if strings.TrimSpace(s.Content.Content) != "" {
+					heading := "AI 摘要"
+					if len(arr) > 1 {
+						heading = fmt.Sprintf("AI 摘要 %d", i+1)
+						if strings.TrimSpace(s.Name) != "" {
+							heading += " · " + strings.TrimSpace(s.Name)
+						}
+					}
+					fmt.Fprintf(&sb, "\n## %s\n\n", heading)
+					if s.Model != "" {
+						fmt.Fprintf(&sb, "_模型：%s_\n\n", s.Model)
+					}
+					sb.WriteString(strings.TrimSpace(s.Content.Content))
+					sb.WriteString("\n")
+				}
+				if s.Content.MindMap != nil && (strings.TrimSpace(s.Content.MindMap.Title) != "" || len(s.Content.MindMap.Children) > 0) {
+					sb.WriteString("\n## 思维导图\n\n```mermaid\nmindmap\n")
+					writeMindMapMermaid(&sb, s.Content.MindMap, 0)
+					sb.WriteString("```\n")
+				}
+			}
 		}
 	}
 	return sb.String()

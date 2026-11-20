@@ -154,20 +154,31 @@ rayneo full -date 2026-11-01 -format md
 rayneo full -id 100000000000000001 -format srt
 rayneo full -date 2026-11-01 -out ./rayneo-export/transcripts
 
-# 5. Query assistant action items, AI suggestions, and AI chat history
-rayneo tasks
-rayneo suggests
-rayneo chat
+# 5. Manage tasks (full CRUD), read AI chat messages, facts, devices, profile, and quota
+rayneo tasks -table
+rayneo tasks add "Submit lab report" -priority high -star
+rayneo tasks done <taskId>
+rayneo tasks delete <taskId>
+rayneo chat -table
+rayneo chat -id <chatId> -md
+rayneo facts -md
+rayneo devices -table
+rayneo profile -onboarding -md
+rayneo quota -table
 
-# 6. Bulk-export a date range (400ms rate-limit spacing) and build an offline Markdown report
+# 6. Export GPS trails & stays (GPX/GeoJSON/KML) or build an Obsidian daily digest
+rayneo trail  -date yesterday -format gpx -wgs84 -geocode -out yesterday.gpx
+rayneo digest -date yesterday -geocode -out ./obsidian/Daily/
+
+# 7. Bulk-export a date range (400ms rate-limit spacing) and build an offline Markdown report
 rayneo export -from 2026-11-01 -to 2026-11-07 -out ./rayneo-export -format all
 rayneo report -dir ./rayneo-export -out ./rayneo-export/weekly-report.md -title "November Week 1 Lifelog"
 
-# 7. Bypass the 5-minute local disk cache when querying newly synced glasses data from today
-rayneo events -date 2026-11-01 -refresh
+# 8. Bypass the 5-minute local disk cache when querying newly synced glasses data from today
+rayneo events -date today -refresh
 ```
 
-### Command Cheatsheet (All 25 Subcommands)
+### Command Cheatsheet (All 31 Subcommands)
 
 For complete flag tables, response schemas, cache policies, and troubleshooting, see **[`docs/CLI.md`](./docs/CLI.md)** (or run `rayneo help --json`).
 
@@ -180,10 +191,13 @@ For complete flag tables, response schemas, cache policies, and troubleshooting,
 | **Read-Only Queries** | `count` / `calendar` | Overall item counts / monthly lifelog availability & one-line daily summaries |
 | | `events` / `event` | Daily events + GPS `trailPoints` / single-event summary, timestamped outline & sub-events |
 | | `jd` / `journal` | AI Daily Story for a **specific date** (`jd -date`) / latest AI Daily Story (`journal`) |
-| | `tasks` / `suggests` / `chat` | Assistant-generated action items / AI suggestions / paginated AI chat history |
+| | `trail` / `digest` | GPS trail & stay exports (`stays`/`gpx`/`geojson`/`kml`, `-geocode`, `-wgs84`) / Obsidian daily digest |
+| | `chat` / `suggests` / `facts` | AI chat list & `-id` full conversation messages / AI suggestions / memory fact cards |
+| | `devices` / `profile` / `quota` | Bound glasses devices / profile & `-onboarding` persona / membership & cloud storage quota |
+| **Tasks (CRUD)** | `tasks` | List tasks (`-table`/`-md`/JSON) and manage them via `add`, `done`, `reopen`, `update`, `delete` |
 | **Transcripts** | `full` | **Full speaker-attributed transcripts** (auto-falls back across conversation & recording stores) |
-| | `recordings` / `transcript` | List recording & live-caption (`cc`) tasks / fetch `aiTask` recording clips directly |
-| **Archive & Utility** | `export` / `report` / `cache` | Rate-limited bulk range export / offline Markdown report builder / inspect or clear disk cache |
+| | `recordings` / `transcript` | List recording & live-caption tasks (`-device`/`-all`/`-json`) / fetch recording transcripts with marks, outline & Mermaid mindMap |
+| **Archive & Utility** | `export` / `report` / `cache` | Rate-limited bulk range export / offline Markdown report builder / inspect, `prune`, or clear disk cache |
 | | `raw` / `help` | Send arbitrary signed gateway requests (for API exploration) / CLI help & `--json` spec |
 
 ---
@@ -209,7 +223,7 @@ Authorization: TCL1-HMAC-SHA256 Credential=<appId>,SignedHeaders=xtcl-nonce;xtcl
 ## Disclaimer
 
 - **Personal Data & Research Only**: This tool is intended solely for accessing and backing up **your own personal account data** and for interoperability research.
-- **Strictly Read-Only**: All query, transcript, and export commands perform read-only requests. No cloud mutation, upload, or deletion endpoints are implemented.
+- **Read-Only First with Explicit Task Writes**: All lifelog events, daily journals, transcripts, and account query commands are strictly read-only. Only explicit task management subcommands (`rayneo tasks add|done|reopen|update|delete`) mutate remote tasks.
 - **Respect Rate Limits**: Keep request rates gentle; prefer `rayneo export` (built-in `400ms` spacing) and the default on-disk cache for multi-day pulls.
 - **Credential Hygiene**: `.har` captures and `~/.config/rayneo-cli/config.json` contain live session tokens and device metadata — never commit them or paste them into public issues (see [`SECURITY.md`](./SECURITY.md)).
 - **Unofficial Project**: Independently developed and **unaffiliated with, neither endorsed nor sponsored by RayNeo (雷鸟创新) or TCL**. Upstream API changes may break functionality at any time.

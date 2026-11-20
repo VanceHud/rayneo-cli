@@ -153,7 +153,7 @@ func (c *Client) Call(method, path string, query url.Values, payload any) (*http
 
 	if c.Cache != nil && resp.StatusCode == 200 && isSuccess(data) {
 		c.Cache.Put(strings.ToUpper(method), path, q, body, data,
-			cache.AutoTTL(q, string(body)))
+			cache.AutoTTLFor(path, q, string(body)))
 	}
 	return resp, data, err
 }

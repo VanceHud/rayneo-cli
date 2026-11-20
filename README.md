@@ -154,20 +154,31 @@ rayneo full -date 2026-11-01 -format md
 rayneo full -id 100000000000000001 -format srt
 rayneo full -date 2026-11-01 -out ./rayneo-export/transcripts
 
-# 5. 查询助手待办任务、AI 建议与 AI 对话记录
-rayneo tasks
-rayneo suggests
-rayneo chat
+# 5. 管理待办任务（增删改查）、查询 AI 建议、AI 对话正文与账号信息
+rayneo tasks -table
+rayneo tasks add "周五前交实验报告" -priority high -star
+rayneo tasks done <taskId>
+rayneo tasks delete <taskId>
+rayneo chat -table
+rayneo chat -id <chatId> -md
+rayneo facts -md
+rayneo devices -table
+rayneo profile -onboarding -md
+rayneo quota -table
 
-# 6. 按日期区间限速批量归档，并离线合并为汇总 Markdown 报告
+# 6. 导出每日 GPS 轨迹与停留点（GPX/GeoJSON/KML），或生成 Obsidian 一站式每日笔记
+rayneo trail  -date yesterday -format gpx -wgs84 -geocode -out yesterday.gpx
+rayneo digest -date yesterday -geocode -out ./obsidian/Daily/
+
+# 7. 按日期区间限速批量归档，并离线合并为汇总 Markdown 报告
 rayneo export -from 2026-11-01 -to 2026-11-07 -out ./rayneo-export -format all
 rayneo report -dir ./rayneo-export -out ./rayneo-export/weekly-report.md -title "11 月第一周全天智记"
 
-# 7. 当天眼镜刚同步新数据、需跳过 5 分钟本地缓存强制拉取最新结果
-rayneo events -date 2026-11-01 -refresh
+# 8. 当天眼镜刚同步新数据、需跳过 5 分钟本地缓存强制拉取最新结果
+rayneo events -date today -refresh
 ```
 
-### 命令速查表（共 25 个子命令）
+### 命令速查表（共 31 个子命令）
 
 完整参数、返回结构、缓存策略与排障指南请查阅 **[`docs/CLI.md`](./docs/CLI.md)**（或运行 `rayneo help --json`）。
 
@@ -180,10 +191,13 @@ rayneo events -date 2026-11-01 -refresh
 | **只读查询** | `count` / `calendar` | 全局统计计数 / 月度日历打卡与每日一句话摘要 |
 | | `events` / `event` | 单日事件列表（含 GPS `trailPoints`） / 单事件摘要、提纲与子事件 |
 | | `jd` / `journal` | **指定日期**的 AI 每日故事详情（`jd -date`） / 最新一篇每日故事 |
-| | `tasks` / `suggests` / `chat` | AI 助手提取的待办事项 / AI 建议列表 / AI 对话历史分页 |
+| | `trail` / `digest` | GPS 轨迹与停留点导出（`stays`/`gpx`/`geojson`/`kml`，支持 `-geocode`、`-wgs84`） / Obsidian 一站式每日笔记 |
+| | `chat` / `suggests` / `facts` | AI 对话列表与 `-id` 完整问答正文 / AI 建议 / AI 记忆事实卡 |
+| | `devices` / `profile` / `quota` | 绑定眼镜设备 / 智记设置与 `-onboarding` 引导画像 / 会员等级与云空间额度 |
+| **待办管理** | `tasks` | 待办列表（`-table`/`-md`/JSON）与完整写操作：`add` / `done` / `reopen` / `update` / `delete` |
 | **逐句转录** | `full` | **全量对话+录音逐句转录**（自动回退双存储，支持 `md`/`txt`/`srt`/`json`） |
-| | `recordings` / `transcript` | 列出录音与实时字幕任务（`taskId`） / 单独拉取 `aiTask` 录音转录 |
-| **归档与工具** | `export` / `report` / `cache` | 区间限速批量导出 / 离线合并日记报告 / 查看与清理本地磁盘缓存 |
+| | `recordings` / `transcript` | 列出录音与实时字幕任务（支持 `-device`/`-all`/`-json`） / 拉取录音转录（含打点、提纲、摘要与 Mermaid 脑图） |
+| **归档与工具** | `export` / `report` / `cache` | 区间限速批量导出 / 离线合并日记报告 / 查看、`prune` 清理过期或清空本地磁盘缓存 |
 | | `raw` / `help` | 发送任意已签名的网关请求（调试用） / 查看帮助与 `--json` 机器规格 |
 
 ---
@@ -209,7 +223,7 @@ Authorization: TCL1-HMAC-SHA256 Credential=<appId>,SignedHeaders=xtcl-nonce;xtcl
 ## 免责声明
 
 - **用途限定**：本项目仅用于**用户本人读取、备份自己账号下的个人数据**以及客户端协议互操作性研究。
-- **严格只读**：所有业务查询与导出命令均为只读（Read-Only）操作，未实现且不会提供任何修改、上传或删除云端数据的写接口。
+- **只读优先与明确写边界**：所有全天智记事件、每日故事、转录与账户信息命令均为严格只读；仅待办管理子命令 `rayneo tasks add|done|reopen|update|delete` 支持修改个人待办。
 - **请求频率**：请自觉控制请求频率，避免对服务端造成压力；批量拉取请使用内置 `400ms` 间隔与本地缓存的 `rayneo export`。
 - **隐私安全**：`.har` 抓包文件与 `~/.config/rayneo-cli/config.json` 含有个人登录凭证与设备信息，切勿上传至公开仓库或粘贴在 Issue 中（详见 [`SECURITY.md`](./SECURITY.md)）。
 - **非官方声明**：本项目为独立社区开源项目，与雷鸟创新（RayNeo）及 TCL 无任何隶属、合作、授权或背书关系。官方接口变更可能导致工具失效。

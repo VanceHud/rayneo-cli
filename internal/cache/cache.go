@@ -33,9 +33,10 @@ type Cache struct {
 
 // TTL policies.
 const (
-	TTLPast     = 30 * 24 * time.Hour // finished days
-	TTLToday    = 5 * time.Minute     // still accumulating
-	TTLVolatile = 10 * time.Minute    // counts / tasks / chats
+	TTLPast        = 30 * 24 * time.Hour // finished days / reverse geocode
+	TTLEventDetail = 6 * time.Hour       // event detail / full transcripts / recording clips
+	TTLToday       = 5 * time.Minute     // still accumulating (today or future)
+	TTLVolatile    = 10 * time.Minute    // counts / tasks / chats
 )
 
 // New returns a cache rooted at dir (created lazily).
@@ -49,6 +50,19 @@ var uncacheable = []string{
 	"/cloudapi/",
 }
 
+// readOnlyPostPaths lists POST endpoints that are strictly read-only queries
+// and safe to cache. Any other POST (and all PUT/PATCH/DELETE) is never cached.
+var readOnlyPostPaths = map[string]bool{
+	"/lifelog/api/v1/calendar":           true,
+	"/lifelog/api/v1/journal/detail":     true,
+	"/summary-service/suggest/list":      true,
+	"/summary-service/summary/list":      true,
+	"/clsapi/aiTask/v2/selectPage":       true,
+	"/clsapi/aiTask/getDataAllByTaskId":  true,
+	"/nlp/rayClaw/listAppSkills":         true,
+	"/agent/user-config/list":            true,
+}
+
 func uncacheablePath(p string) bool {
 	for _, pre := range uncacheable {
 		if strings.HasPrefix(p, pre) {
@@ -58,11 +72,39 @@ func uncacheablePath(p string) bool {
 	return false
 }
 
-// AutoTTL decides how long a response stays fresh.
-//
-// A past YYYY-MM-DD date (or a past YYYYMM month) => 30 days, today => 5 min,
-// anything else (counts, tasks, chats, suggestions) => 10 min.
+// IsCacheable reports whether a request method + path may be read from or stored
+// in the disk cache. Write methods and unknown POST paths are never cached.
+func IsCacheable(method, path string) bool {
+	if uncacheablePath(path) {
+		return false
+	}
+	switch strings.ToUpper(strings.TrimSpace(method)) {
+	case "GET":
+		return true
+	case "POST":
+		return readOnlyPostPaths[path]
+	default:
+		return false
+	}
+}
+
+// AutoTTL decides how long a response stays fresh based on query and body.
 func AutoTTL(query, body string) time.Duration {
+	return AutoTTLFor("", query, body)
+}
+
+// AutoTTLFor decides how long a response stays fresh based on path, query, and body.
+//
+// Rules:
+//   - /profileapi/geo/reverseGeocode => 30 days
+//   - today or future YYYY-MM-DD (or current YYYYMM month) => 5 min
+//   - past YYYY-MM-DD (or past YYYYMM month) => 30 days
+//   - /lifelog/api/v1/events/{id}[/full] or /clsapi/aiTask/getDataAllByTaskId => 6 hours
+//   - everything else (counts, tasks, chats, suggestions) => 10 min
+func AutoTTLFor(path, query, body string) time.Duration {
+	if path == "/profileapi/geo/reverseGeocode" {
+		return TTLPast
+	}
 	blob := query + " " + body
 	now := time.Now()
 	today := now.Format("2006-01-02")
@@ -73,10 +115,16 @@ func AutoTTL(query, body string) time.Duration {
 		return TTLToday
 	}
 	if d := findDate(blob); d != "" {
-		return TTLPast
+		if d < today {
+			return TTLPast
+		}
+		return TTLToday
 	}
 	if m := findMonth(blob); m != "" && m < thisMonth {
 		return TTLPast
+	}
+	if strings.HasPrefix(path, "/lifelog/api/v1/events/") || path == "/clsapi/aiTask/getDataAllByTaskId" {
+		return TTLEventDetail
 	}
 	return TTLVolatile
 }
@@ -140,7 +188,7 @@ func (c *Cache) file(key string) string {
 
 // Get returns a fresh cached body.
 func (c *Cache) Get(method, path, query string, body []byte) ([]byte, bool) {
-	if c == nil || !c.Enabled || c.Force || uncacheablePath(path) {
+	if c == nil || !c.Enabled || c.Force || !IsCacheable(method, path) {
 		return nil, false
 	}
 	b, err := os.ReadFile(c.file(c.key(method, path, query, body)))
@@ -163,7 +211,7 @@ func (c *Cache) Get(method, path, query string, body []byte) ([]byte, bool) {
 
 // Put stores a successful response.
 func (c *Cache) Put(method, path, query string, body, resp []byte, ttl time.Duration) {
-	if c == nil || !c.Enabled || uncacheablePath(path) || len(resp) == 0 {
+	if c == nil || !c.Enabled || !IsCacheable(method, path) || len(resp) == 0 {
 		return
 	}
 	if c.TTL > 0 {
@@ -237,4 +285,63 @@ func (c *Cache) Clear() error {
 		return fmt.Errorf("empty cache dir")
 	}
 	return os.RemoveAll(c.Dir)
+}
+
+// Prune removes only stale or unreadable cache files, keeping fresh entries intact.
+func (c *Cache) Prune() (removed int, bytesFreed int64) {
+	if c == nil || c.Dir == "" {
+		return 0, 0
+	}
+	now := time.Now()
+	_ = filepath.Walk(c.Dir, func(p string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() || !strings.HasSuffix(p, ".json") {
+			return nil
+		}
+		stale := false
+		b, rerr := os.ReadFile(p)
+		if rerr != nil {
+			stale = true
+		} else {
+			var e Entry
+			if json.Unmarshal(b, &e) != nil {
+				stale = true
+			} else if now.Sub(time.Unix(e.FetchedAt, 0)) > time.Duration(e.TTL)*time.Second {
+				stale = true
+			}
+		}
+		if stale {
+			sz := info.Size()
+			if os.Remove(p) == nil {
+				removed++
+				bytesFreed += sz
+			}
+		}
+		return nil
+	})
+	return removed, bytesFreed
+}
+
+// InvalidatePrefix removes cached entries whose stored Path starts with pathPrefix.
+func (c *Cache) InvalidatePrefix(pathPrefix string) int {
+	if c == nil || c.Dir == "" || pathPrefix == "" {
+		return 0
+	}
+	removed := 0
+	_ = filepath.Walk(c.Dir, func(p string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() || !strings.HasSuffix(p, ".json") {
+			return nil
+		}
+		b, rerr := os.ReadFile(p)
+		if rerr != nil {
+			return nil
+		}
+		var e Entry
+		if json.Unmarshal(b, &e) == nil && strings.HasPrefix(e.Path, pathPrefix) {
+			if os.Remove(p) == nil {
+				removed++
+			}
+		}
+		return nil
+	})
+	return removed
 }

@@ -2,7 +2,7 @@
 
 [返回中文主页](../README.md) · [English README](../README_EN.md) · [安全策略](../SECURITY.md)
 
-本文档提供 `rayneo` 全部 **25 个子命令**、全局开关、环境变量、方案 A（被动 Token Broker）自动同步机制、双存储引擎转录架构、本地磁盘缓存策略以及 `TCL1-HMAC-SHA256` 网关签名协议的完整说明。
+本文档提供 `rayneo` 全部 **31 个子命令**、全局开关、环境变量、方案 A（被动 Token Broker）自动同步机制、任务增删改查（CRUD）、GPS 轨迹与 Obsidian 每日笔记导出、双存储引擎转录架构、本地磁盘缓存策略以及 `TCL1-HMAC-SHA256` 网关签名协议的完整说明。
 
 ---
 
@@ -10,7 +10,7 @@
 
 - [快速开始](#快速开始)
 - [安装与构建](#安装与构建)
-- [命令一览（25 个子命令）](#命令一览25-个子命令)
+- [命令一览（31 个子命令）](#命令一览31-个子命令)
 - [全局开关与环境变量](#全局开关与环境变量)
 - [输出与管道处理](#输出与管道处理)
 - [批量导出与报告合成](#批量导出与报告合成)
@@ -106,9 +106,9 @@ go build -trimpath -o ./bin/rayneo ./cmd/rayneo
 
 ---
 
-## 命令一览（25 个子命令）
+## 命令一览（31 个子命令）
 
-运行 `rayneo help` 查看终端帮助，`rayneo help --json` 输出完整机器可读规格。
+运行 `rayneo help` 查看终端帮助，`rayneo help --json` 输出完整机器可读规格。所有 `-date` / `-from` / `-to` 参数除 `YYYY-MM-DD` 外，也支持 `today`、`yesterday` 与 `-Nd`（如 `-7d`）。
 
 ### 1. 认证与配置（8 个）
 
@@ -123,7 +123,7 @@ go build -trimpath -o ./bin/rayneo ./cmd/rayneo
 | `logout` | 本地修改 | 清空本地保存的 Token、过期时间、ETag、账号与客户端标识头（不清理磁盘缓存与 Broker 地址） |
 | `config [-base url] [-region cn\|us\|sg\|eu] [-token tok] [-har file] [-broker-url url] [-broker-secret sec] [-no-refresh]` | 本地修改 | 更新网关 Base URL、区域、手动写入 Token、Broker 配置（输出自动脱敏密钥）或切换 `no_refresh` 开关 |
 
-### 2. 业务查询（9 个，全部严格只读）
+### 2. 业务查询（14 个，全部严格只读）
 
 | 子命令 | 接口 | 说明 |
 |---|---|---|
@@ -133,27 +133,43 @@ go build -trimpath -o ./bin/rayneo ./cmd/rayneo
 | `event -id <eventId> [-raw]` | `GET /lifelog/api/v1/events/{id}` | 单条日内事件详情：摘要、带时间戳要点（`outline`）、原始子事件与转录来源（默认渲染 Markdown，`-raw` 输出原始 JSON） |
 | `journal` | `GET /lifelog/api/v1/journal/latest` | 获取**最新一篇** AI 每日故事（服务端忽略 `-date`，别名：`story`） |
 | `jd [-date YYYY-MM-DD]` | `POST /lifelog/api/v1/journal/detail` | 获取**指定日期**的 AI 每日故事详情（默认当天，别名：`journal-detail`） |
+| `trail [-date YYYY-MM-DD] [-format stays\|gpx\|geojson\|kml\|json] [-geocode] [-wgs84] [-out file]` | `GET /lifelog/api/v1/events`（`-geocode` 额外调 `GET /profileapi/geo/reverseGeocode`） | 导出每日 GPS 轨迹与停留点（估算里程、关联事件标题、可选逆地理编码省市区、可选 China GCJ-02→WGS-84 纠偏） |
+| `digest [-date today\|yesterday\|YYYY-MM-DD] [-with-transcripts] [-geocode] [-wgs84] [-out file\|dir]` | 聚合 `events` + `jd` + `tasks`（+ 可选 `full`） | 生成带 YAML Frontmatter 的 **Obsidian 一站式每日笔记**（含每日故事、事件时间线、停留点、关联待办与可选折叠逐句转录；别名：`today`） |
 | `suggests` | `POST /summary-service/suggest/list` | AI 建议列表 |
-| `tasks` | `GET /action/api/v2/tasks` | AI 助手生成的待办事项（自动附带 `accountId` 与 `sources=rayneoTasks`） |
-| `chat` | `GET /clsapi/aiChat/selectPage` | AI 对话历史分页记录 |
+| `chat [-id <chatId>] [-n 30] [-deadline ms] [-all] [-format json\|md\|table] [-out file]` | `GET /clsapi/aiChat/selectPage` / `GET /clsapi/aiChatMsg/selectPage` | 列出 AI 对话会话（默认 JSON，支持 `-table`/`-md`），或传入 `-id <chatId>` 拉取完整问答消息正文（自动折叠 `<thought>`） |
+| `facts [-status 2] [-format json\|md]` | `GET /factsapi/api/v1/facts/list` | AI 记忆事实卡（已确认与待审核列表，支持 `-md`） |
+| `devices [-format json\|table\|md]` | `GET /identify/device/list` | 已绑定雷鸟眼镜设备列表（名称、型号、SN、MAC、`glassesDeviceId`） |
+| `profile [-onboarding] [-format json\|md]` | `GET /profileapi/v1/profile/query`（`-onboarding` 额外调 `/lifelog/api/v1/settings/onboarding`） | 账号智记设置档案；附加 `-onboarding` 可同时查看自我介绍、关注目标、常用语言与权限状态 |
+| `quota [-usages] [-page 1] [-size 20] [-resource-type ...] [-format json\|table\|md]` | `GET /balance/members` / `GET /balance/usages` | 会员等级、有效期、资源包额度（AI 高级模型、专题数、10GB 云空间自动格式化为 MB/GB）与可选消费流水（别名：`balance`） |
 
-### 3. 逐句转录（3 个，全部严格只读）
+### 3. 待办任务管理（1 个，支持完整读/写 CRUD）
 
 | 子命令 | 接口 | 说明 |
 |---|---|---|
-| `full (-id <eventId> \| -date YYYY-MM-DD) [-format md\|txt\|srt\|json] [-out dir] [-tz Asia/Shanghai]` | `GET /lifelog/api/v1/events/{id}/full`（录音事件自动回退 `getDataAllByTaskId`） | **统一逐句转录入口**：导出按话题分组的对话及独立录音逐句内容、说话人与时间戳 |
-| `recordings [-type recording\|cc\|''] [-n 50]` | `POST /clsapi/aiTask/v2/selectPage` | 列出录音（`recording`）或实时字幕（`cc`）任务及其 `taskId` |
-| `transcript (-id <taskId> \| -date YYYY-MM-DD) [-format md\|txt\|srt\|json] [-out dir] [-tz Asia/Shanghai]` | `POST /clsapi/aiTask/getDataAllByTaskId` | 直接拉取录音类任务的 `recording.clips[]` 逐句转录（别名：`tr`） |
+| `tasks [list] [-status all\|pending\|completed] [-format json\|table\|md] [-source rayneoTasks]` | `GET /action/api/v2/tasks` | 列出待办（默认只读输出 JSON；支持 `-table`、`-md` 与状态过滤；别名：`task`） |
+| `tasks add <content> [-desc text] [-priority normal\|high] [-star] [-due YYYY-MM-DD\|today\|tomorrow\|+Nd] [-tz Asia/Shanghai] [-json]` | `POST /action/api/v2/tasks/create` | 新建待办（`priority`: `high=0`, `normal=1`；`-due` 自动转换为服务端毫秒时间戳；成功后自动清理本地待办缓存；别名：`create`、`new`） |
+| `tasks done <id...> [-source rayneoTasks] [-list-id id] [-json]` | `POST /action/api/v2/tasks/{id}/complete` | 将一个或多个待办标记为已完成并刷新本地缓存（别名：`complete`） |
+| `tasks reopen <id...> [-source rayneoTasks] [-list-id id] [-json]` | `POST /action/api/v2/tasks/{id}/reopen` | 取消完成、重新打开一个或多个待办（别名：`undone`、`uncomplete`） |
+| `tasks update <id> [-content ...] [-desc ...] [-priority ...] [-star=true\|false] [-completed=true\|false] [-due ...] [-json]` | `POST /action/api/v2/tasks/{id}` | 更新待办字段（自动先拉取原任务保留未修改字段，避免覆盖丢失；别名：`edit`） |
+| `tasks delete <id...> [-source rayneoTasks] [-list-id id] [-json]` | `DELETE /action/api/v2/tasks/{id}?source=...` | 删除一个或多个待办并刷新本地缓存（别名：`rm`、`del`） |
 
-### 4. 批量归档与缓存（3 个，全部本地/只读）
+### 4. 逐句转录（3 个，全部严格只读）
+
+| 子命令 | 接口 | 说明 |
+|---|---|---|
+| `full (-id <eventId> \| -date YYYY-MM-DD) [-format md\|txt\|srt\|json] [-out dir] [-tz Asia/Shanghai]` | `GET /lifelog/api/v1/events/{id}/full`（录音事件自动回退 `getDataAllByTaskId`） | **统一逐句转录入口**：导出按话题分组的对话及独立录音逐句内容、说话人与时间戳（stdout 与 `-out` 均支持录音自动回退） |
+| `recordings [-type recording\|cc\|''] [-device RayNeoS3] [-n 50] [-deadline ms] [-all] [-json]` | `POST /clsapi/aiTask/v2/selectPage` | 列出录音（`recording`）或实时字幕（`cc`）任务及其 `taskId`（支持 `-device ''` 查全部机型、`-all` 自动翻页与 `-json`） |
+| `transcript (-id <taskId> \| -date YYYY-MM-DD) [-format md\|txt\|srt\|json] [-out dir] [-tz Asia/Shanghai]` | `POST /clsapi/aiTask/getDataAllByTaskId` | 拉取录音任务的完整逐句转录，Markdown 自动渲染**重点打点（marks）、带时间戳提纲（outline）、AI 摘要与 Mermaid 思维导图（mindMap）**（别名：`tr`） |
+
+### 5. 批量归档与缓存（3 个，全部本地/只读）
 
 | 子命令 | 说明 |
 |---|---|
-| `export -from YYYY-MM-DD -to YYYY-MM-DD [-out ./rayneo-export] [-format all\|json\|csv\|md]` | 按日期区间批量拉取每日事件与每日故事，内置 `400ms` 请求间隔 |
-| `report [-dir ./rayneo-export] [-out report.md] [-title "..."]` | 将导出目录中的 `journal-*.md` 离线聚合为带目录锚点的单文件 Markdown 报告（**纯离线 0 网络请求**） |
-| `cache [stat\|ls\|clear]` | 查看缓存统计（文件数、体积、新鲜/过期条目）、最近 20 条缓存记录或清空本地磁盘缓存 |
+| `export -from YYYY-MM-DD -to YYYY-MM-DD [-out ./rayneo-export] [-format all\|json\|csv\|md] [-tz Asia/Shanghai]` | 按日期区间批量拉取每日事件与每日故事，内置 `400ms` 请求间隔 |
+| `report [-dir ./rayneo-export] [-out report.md] [-title "..."]` | 将导出目录中的 `journal-*.md` 离线聚合为带每日标题目录锚点的单文件 Markdown 报告（**纯离线 0 网络请求**） |
+| `cache [stat\|ls\|prune\|clear]` | 查看缓存统计、最近 20 条记录、`prune` 仅清理已过期缓存或 `clear` 清空全部缓存 |
 
-### 5. 调试与帮助工具（2 个）
+### 6. 调试与帮助工具（2 个）
 
 | 子命令 | 说明 |
 |---|---|
@@ -356,16 +372,18 @@ SRT 字幕输出示例（`-format srt`）：
 
 | 请求类型 | 默认缓存 TTL |
 |---|---|
-| 历史日期（早于今天）的 `events` / `journal/detail` / `calendar` | **30 天** |
-| 当天日期的数据 | **5 分钟** |
-| 动态列表（`count` / `tasks` / `chat` / `suggests` / `recordings`） | **10 分钟** |
-| 认证与会话接口（`sendcode` / `login` / `refresh`） | **永不缓存** |
+| 历史日期（早于今天）的 `events` / `journal/detail` / `calendar` 与 `reverseGeocode` | **30 天** |
+| 事件详情与逐句转录（`/events/{id}`、`/events/{id}/full`、`getDataAllByTaskId`） | **6 小时** |
+| 当天及未来日期的数据 | **5 分钟** |
+| 动态列表（`count` / `tasks` / `chat` / `suggests` / `recordings` / `facts` / `quota`） | **10 分钟** |
+| 认证接口与所有写操作（`sendcode` / `login` / `refresh` / `tasks add\|done\|reopen\|update\|delete`） | **永不缓存**（待办写操作成功后自动清除本地 `/action/api/v2/tasks` 缓存） |
 
 缓存管理命令：
 
 ```bash
 rayneo cache stat                                      # 查看缓存目录、文件数、新鲜与过期条目数
 rayneo cache ls                                        # 列出最近写入的 20 条缓存记录
+rayneo cache prune                                     # 仅清理已过期缓存条目，保留新鲜历史缓存
 rayneo cache clear                                     # 清空全部缓存文件
 rayneo events -date 2026-11-01 -refresh                # 忽略本地缓存，强制从服务端拉取并更新缓存
 rayneo events -date 2026-11-01 -no-cache               # 本次请求完全跳过缓存读写
@@ -418,9 +436,9 @@ Authorization: TCL1-HMAC-SHA256 Credential=<appId>,SignedHeaders=xtcl-nonce;xtcl
 rayneo help --json
 ```
 
-输出包含全部 25 个子命令的名称、功能说明、参数列表与默认值、对应 HTTP 方法与路径、示例及 `read_only` 布尔标记：
-- `read_only: false` 仅限认证/配置/调试类命令：`sync`、`har`、`sendcode`、`login`、`refresh`、`logout`、`config`、`raw`。
-- 其余 17 个查询、转录、导出、报告、缓存与帮助命令均为 `read_only: true`。
+输出包含全部 31 个子命令的名称、功能说明、参数列表与默认值、对应 HTTP 方法与路径、示例、`read_only` 以及 `requires_confirmation` 布尔标记：
+- `read_only: false` 且 `requires_confirmation: true`（**非只读，执行前必须获得用户明确许可**）：`sync`（`-status` 除外）、`har`（`-dry-run` 除外）、`sendcode`、`login`、`refresh`、`logout`、`config`、`tasks`（默认 `list` 只读；仅 `add`/`done`/`reopen`/`update`/`delete` 为写操作）、`raw`（写请求）。
+- 其余 22 个查询、轨迹、每日笔记、账户信息、转录、导出、报告、缓存与帮助命令均为 `read_only: true`。
 
 ---
 
@@ -512,7 +530,7 @@ rayneo raw -X GET -p /lifelog/api/v1/count -debug
 
 ## 已知限制
 
-- **严格只读设计**：未实现且不计划实现删除事件、修改设置或上传文件等写操作接口。
+- **写操作范围说明**：所有全天智记事件、每日故事、转录与账户信息接口均为严格只读；仅待办管理子命令 `rayneo tasks add|done|reopen|update|delete` 支持写操作。
 - **`journal` 与 `jd` 的区别**：`GET /lifelog/api/v1/journal/latest`（`rayneo journal`）服务端忽略日期参数，永远只返回最新一篇；按日期拉取每日故事必须使用 `rayneo jd -date YYYY-MM-DD`。
 - **实时字幕（`cc`）无逐句切片**：`aiTask` 服务仅对 `recording` 类型存储逐句 `clips`，`cc` 类型仅返回任务元数据。
 - **GPS 轨迹体积**：单日户外活动较多时 `events` 返回的 `trailPoints` 经纬度数组体积较大，处理 JSON 时建议按需用 `jq` 过滤字段。
