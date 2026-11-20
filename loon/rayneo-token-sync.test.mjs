@@ -1115,3 +1115,113 @@ test("EDGE CASES: top-level quickLogin fields, delayed enrichment, header/query 
   assert.equal(h2.posts.length, 2);
 });
 
+test("Concurrency: 10s in-flight cooldown deduplicates startup request bursts, auto-expires on hang, and does not block token rotation", () => {
+  const store = createMockStore();
+  const pendingCallbacks = [];
+  const posts = [];
+  const notifications = [];
+  const doneCalls = [];
+  let nowMs = Date.parse("2026-11-20T12:00:00.000Z");
+
+  const makeEnv = (req, resp) => ({
+    $request: req,
+    $response: resp,
+    $argument: {
+      broker_url: "https://broker.example.test",
+      broker_secret: "secret-abc",
+      notify: true,
+      debug: true,
+    },
+    $persistentStore: store,
+    $httpClient: {
+      post(options, cb) {
+        posts.push({ ...options, parsedBody: JSON.parse(options.body) });
+        pendingCallbacks.push(cb);
+      },
+    },
+    $notification: {
+      post(title, subtitle, body) {
+        notifications.push({ title, subtitle, body });
+      },
+    },
+    $done(res) {
+      doneCalls.push(res);
+    },
+    now: () => nowMs,
+    log() {},
+  });
+
+  const reqA = {
+    url: "https://xr-api-p.rayneo.cn/lifelog/api/v1/events",
+    headers: {
+      "xtcl-access-token": "TOK_BURST_0001",
+      "user-agent": "RayNeo/3.5.0",
+      "phone-model": "iPhone16,2",
+    },
+  };
+
+  // Simulate 5 concurrent requests arriving before the first POST returns
+  for (let i = 0; i < 5; i++) {
+    syncScript.run(makeEnv(reqA));
+  }
+  assert.equal(posts.length, 1, "only the first concurrent request may POST");
+  assert.equal(doneCalls.length, 4, "4 deduplicated requests must finish immediately");
+  assert.equal(pendingCallbacks.length, 1);
+
+  // Resolve the first POST -> clears inflight state, writes LAST_TOKEN, fires 1 notification
+  pendingCallbacks.shift()(
+    null,
+    { status: 200 },
+    JSON.stringify({ ok: true, updated: true, revision: 1, token_fp: "fp0001" })
+  );
+  assert.equal(doneCalls.length, 5);
+  assert.equal(notifications.length, 1);
+  assert.equal(store.read(syncScript.STORAGE_KEYS.INFLIGHT_STATE), "");
+
+  // Subsequent request hits normal fast-path
+  syncScript.run(makeEnv(reqA));
+  assert.equal(posts.length, 1);
+
+  // Simulate a hung POST for a new token TOK_HUNG_0002 (callback never fires)
+  const reqHung = {
+    url: "https://xr-api-p.rayneo.cn/lifelog/api/v1/events",
+    headers: {
+      "xtcl-access-token": "TOK_HUNG_0002",
+      "user-agent": "RayNeo/3.5.0",
+    },
+  };
+  syncScript.run(makeEnv(reqHung));
+  assert.equal(posts.length, 2);
+
+  // Within 10s -> blocked by in-flight cooldown
+  nowMs += syncScript.INFLIGHT_COOLDOWN_MS - 1000;
+  syncScript.run(makeEnv(reqHung));
+  assert.equal(posts.length, 2);
+
+  // A DIFFERENT rotated token during the 10s window is NOT blocked
+  const reqRotated = {
+    url: "https://xr-api-p.rayneo.cn/lifelog/api/v1/events",
+    headers: {
+      "xtcl-access-token": "TOK_ROTATED_0003",
+      "user-agent": "RayNeo/3.5.0",
+    },
+  };
+  syncScript.run(makeEnv(reqRotated));
+  assert.equal(posts.length, 3);
+  assert.equal(posts[2].parsedBody.access_token, "TOK_ROTATED_0003");
+
+  // After 10s expires, a hung token retries cleanly
+  nowMs += syncScript.INFLIGHT_COOLDOWN_MS + 1;
+  syncScript.run(makeEnv(reqRotated));
+  assert.equal(posts.length, 4);
+
+  // Complete callback so state stays clean
+  pendingCallbacks.pop()(
+    null,
+    { status: 200 },
+    JSON.stringify({ ok: true, updated: true, revision: 2, token_fp: "fp0003" })
+  );
+  assert.equal(store.read(syncScript.STORAGE_KEYS.LAST_TOKEN), "TOK_ROTATED_0003");
+});
+
+

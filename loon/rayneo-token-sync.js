@@ -19,6 +19,7 @@
 
   var LOG_PREFIX = "[RayNeo Sync]";
   var HTTP_TIMEOUT_MS = 4000;
+  var INFLIGHT_COOLDOWN_MS = 10000;
   var FAIL_COOLDOWN_MS = 15000;
   var MAX_TOKEN_LEN = 512;
   var MAX_BODY_LEN = 2 * 1024 * 1024;
@@ -58,6 +59,7 @@
     META_SYNCED_TOKEN: "rayneo_sync_meta_synced_token",
     AUTH_SYNCED_TOKEN: "rayneo_sync_auth_synced_token",
     LAST_BROKER_URL: "rayneo_sync_last_broker_url",
+    INFLIGHT_STATE: "rayneo_sync_inflight_state",
     FAIL_STATE: "rayneo_sync_fail_state",
     // Fallback config keys when $argument is omitted
     CFG_BROKER_URL: "rayneo_sync_broker_url",
@@ -538,6 +540,57 @@
     store.write(STORAGE_KEYS.FAIL_STATE, "");
   }
 
+  function readInflightState(store) {
+    var raw = store.read(STORAGE_KEYS.INFLIGHT_STATE);
+    if (!raw) return null;
+    try {
+      var parsed = JSON.parse(raw);
+      if (
+        parsed &&
+        typeof parsed.token === "string" &&
+        typeof parsed.brokerUrl === "string" &&
+        typeof parsed.phase === "string" &&
+        typeof parsed.until === "number"
+      ) {
+        return parsed;
+      }
+    } catch (_) {
+      // Ignore corrupt state
+    }
+    return null;
+  }
+
+  function isInflightActive(store, token, brokerUrl, phase, nowMs) {
+    var st = readInflightState(store);
+    return !!(
+      st &&
+      st.token === token &&
+      st.brokerUrl === brokerUrl &&
+      st.phase === phase &&
+      nowMs < st.until
+    );
+  }
+
+  function writeInflightState(store, token, brokerUrl, phase, untilMs) {
+    try {
+      store.write(
+        STORAGE_KEYS.INFLIGHT_STATE,
+        JSON.stringify({
+          token: token,
+          brokerUrl: brokerUrl,
+          phase: phase,
+          until: untilMs,
+        })
+      );
+    } catch (_) {
+      // Ignore
+    }
+  }
+
+  function clearInflightState(store) {
+    store.write(STORAGE_KEYS.INFLIGHT_STATE, "");
+  }
+
   function buildBrokerPayload(opts) {
     var payload = {
       access_token: opts.accessToken,
@@ -724,6 +777,16 @@
           return finish();
         }
 
+        if (
+          isInflightActive(store, auth.accessToken, config.brokerUrl, "auth", nowMs)
+        ) {
+          debugLog(
+            "in-flight cooldown active (auth); skip duplicate " +
+              maskToken(auth.accessToken)
+          );
+          return finish();
+        }
+
         // Safely inspect request headers for allowlisted metadata only.
         // CRITICAL: NEVER read `xtcl-access-token` in http-response mode!
         var reqHeaders = normalizeHeaders(req.headers);
@@ -747,6 +810,13 @@
         });
 
         var isNewAuthToken = auth.accessToken !== lastToken;
+        writeInflightState(
+          store,
+          auth.accessToken,
+          config.brokerUrl,
+          "auth",
+          nowMs + INFLIGHT_COOLDOWN_MS
+        );
         return uploadToBroker(
           env,
           config,
@@ -757,6 +827,7 @@
             store.write(STORAGE_KEYS.AUTH_SYNCED_TOKEN, auth.accessToken);
             // Leave META_SYNCED_TOKEN for the next business http-request so
             // full device/app/region headers are enriched once (without expires_in).
+            clearInflightState(store);
             clearFailState(store);
 
             var fp =
@@ -783,6 +854,7 @@
             }
           },
           function onFailure(reason) {
+            clearInflightState(store);
             debugLog("sync failed (" + source + "): " + reason);
           },
           finish
@@ -808,6 +880,12 @@
 
       // INSTANT FAST-PATH: zero network calls when token + metadata already synced.
       if (token === lastToken && metaSyncedToken === token) {
+        return finish();
+      }
+
+      // Prevent concurrent startup bursts from posting duplicate requests for the same token.
+      if (isInflightActive(store, token, config.brokerUrl, "header", nowMs)) {
+        debugLog("in-flight cooldown active (header); skip duplicate");
         return finish();
       }
 
@@ -842,6 +920,14 @@
         clientHeaders: meta.clientHeaders,
       });
 
+      writeInflightState(
+        store,
+        token,
+        config.brokerUrl,
+        "header",
+        nowMs + INFLIGHT_COOLDOWN_MS
+      );
+
       return uploadToBroker(
         env,
         config,
@@ -852,6 +938,7 @@
           if (meta.hasMetadata) {
             store.write(STORAGE_KEYS.META_SYNCED_TOKEN, token);
           }
+          clearInflightState(store);
           clearFailState(store);
 
           var fp =
@@ -873,6 +960,7 @@
           }
         },
         function onFailure(reason) {
+          clearInflightState(store);
           writeFailState(store, token, config.brokerUrl, nowMs + FAIL_COOLDOWN_MS);
           debugLog("sync failed (loon:header): " + reason);
         },
@@ -959,6 +1047,7 @@
     module.exports = {
       ALLOWED_CLIENT_HEADERS: ALLOWED_CLIENT_HEADERS,
       STORAGE_KEYS: STORAGE_KEYS,
+      INFLIGHT_COOLDOWN_MS: INFLIGHT_COOLDOWN_MS,
       FAIL_COOLDOWN_MS: FAIL_COOLDOWN_MS,
       HTTP_TIMEOUT_MS: HTTP_TIMEOUT_MS,
       RAYNEO_API_HOST_RE: RAYNEO_API_HOST_RE,
