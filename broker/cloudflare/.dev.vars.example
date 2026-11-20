@@ -1,0 +1,3 @@
+# Shared Bearer secret used by iOS Loon and `rayneo sync`.
+# Replace with a strong random secret (e.g. `openssl rand -hex 32`) before deploying.
+BROKER_SECRET=replace-with-your-random-secret

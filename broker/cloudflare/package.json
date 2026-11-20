@@ -4,17 +4,28 @@
   "private": true,
   "type": "module",
   "description": "Cloudflare Worker + SQLite Durable Object Token Broker (Scheme A passive access-token mirror) for RayNeo CLI",
+  "cloudflare": {
+    "label": "RayNeo Token Broker",
+    "products": [
+      "Workers",
+      "Durable Objects"
+    ],
+    "bindings": {
+      "BROKER_SECRET": {
+        "description": "Shared Bearer secret for iOS Loon and `rayneo sync`. Generate a strong random value with `openssl rand -hex 32`."
+      }
+    }
+  },
   "scripts": {
     "test": "node --test test/broker.test.ts",
-    "dev": "cf dev",
-    "build": "cf build",
-    "deploy": "cf deploy",
-    "types": "cf workers types",
-    "typecheck": "tsc --noEmit"
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "types": "wrangler types",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm test && wrangler deploy --dry-run"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20261118.1",
-    "cf": "^1.0.0-rc.2",
     "typescript": "^5.8.0",
     "wrangler": "^4.165.0"
   }

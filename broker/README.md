@@ -45,14 +45,24 @@ Key behaviors:
 
 ## Option 1: Cloudflare Workers (SQLite Durable Object)
 
-Uses a SQLite-backed Durable Object (`TokenBrokerDO` with `storage: "sqlite"` in [`cloudflare/cloudflare.config.ts`](./cloudflare/cloudflare.config.ts)), which provides strong consistency on **both Cloudflare Workers Free and Paid plans**.
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/VanceHud/rayneo-cli/tree/main/broker/cloudflare)
 
-### Prerequisites
+Uses a SQLite-backed Durable Object (`TokenBrokerDO` with `new_sqlite_classes` in [`cloudflare/wrangler.jsonc`](./cloudflare/wrangler.jsonc)), which provides strong consistency on **both Cloudflare Workers Free and Paid plans**.
+
+### One-Click Deploy (Recommended)
+
+1. Click the **Deploy to Cloudflare** button above — Cloudflare automatically clones [`broker/cloudflare/`](./cloudflare/), provisions the `TokenBrokerDO` SQLite Durable Object, and prompts you for **`BROKER_SECRET`** (declared via [`.dev.vars.example`](./cloudflare/.dev.vars.example) and [`package.json`](./cloudflare/package.json)).
+2. Generate a strong random value (e.g. `openssl rand -hex 32`) and paste it into the `BROKER_SECRET` field on the deploy page.
+3. *(Recommended in mainland China)* After deployment, bind a custom domain in **Workers & Pages → Settings → Domains & Routes** so iOS Loon and `rayneo-cli` can connect directly without proxying `*.workers.dev`.
+
+### Manual CLI Deploy (Wrangler)
+
+#### Prerequisites
 
 - Node.js 22+
 - A Cloudflare account
 
-### 1. Generate a strong `BROKER_SECRET`
+#### 1. Generate a strong `BROKER_SECRET`
 
 ```bash
 openssl rand -hex 32
@@ -60,33 +70,25 @@ openssl rand -hex 32
 
 Save this value — you will configure it in Cloudflare Workers, your iOS Loon plugin, and `rayneo sync`.
 
-### 2. Install & deploy with `cf` CLI
+#### 2. Install & deploy with Wrangler
 
 ```bash
 cd broker/cloudflare
 npm install
 
 # Log in to Cloudflare (first time only)
-npx cf auth login
+npx wrangler login
 
-# Deploy the Worker, provision the SQLite Durable Object, and upload BROKER_SECRET
-# (store the secret only in a temporary 0600 file outside git and remove it right after)
-SEC_FILE="$(mktemp /tmp/rayneo-cf-secrets.XXXXXX.json)"
-chmod 600 "$SEC_FILE"
-printf '{"BROKER_SECRET":"%s"}\n' "<your-secret>" > "$SEC_FILE"
-npx cf deploy --secrets-file "$SEC_FILE"
-rm -f "$SEC_FILE"
+# Deploy the Worker and provision the SQLite Durable Object migration
+npm run deploy
+
+# Store BROKER_SECRET securely as a Worker secret (never commit it to git)
+npx wrangler secret put BROKER_SECRET
 ```
 
-`cf deploy` prints your HTTPS URL (for example `https://rayneo-token-broker.<your-subdomain>.workers.dev`). To bind a custom domain directly from the CLI (recommended in mainland China so iOS Loon and CLI can connect without proxying `*.workers.dev`), pass `BROKER_CUSTOM_DOMAIN`:
+Wrangler prints your HTTPS URL (for example `https://rayneo-token-broker.<your-subdomain>.workers.dev`). You may also bind a custom domain in the Cloudflare Dashboard under **Workers & Pages → Settings → Domains & Routes**.
 
-```bash
-BROKER_CUSTOM_DOMAIN=broker.example.com npx cf workers triggers deploy
-```
-
-(Or bind a custom domain in the Cloudflare Dashboard under **Workers & Pages → Settings → Domains & Routes**.)
-
-### 3. Local development & unit tests
+#### 3. Local development & unit tests
 
 Unit tests run directly with Node 22's built-in test runner and `node:sqlite` (no `npm install` or Cloudflare credentials required):
 
@@ -95,18 +97,17 @@ cd broker/cloudflare
 npm test
 ```
 
-To regenerate Worker types and typecheck (after `npm install`):
+To run full local validation (typecheck + tests + dry-run bundle):
 
 ```bash
-npm run types
-npm run typecheck
+npm run check
 ```
 
-To run locally with `cf dev`:
+To run locally with Wrangler:
 
 ```bash
-# Create local-only secret file (gitignored)
-printf 'BROKER_SECRET=%s\n' "local-dev-secret" > .dev.vars
+# Copy example secret file (gitignored .dev.vars) and replace placeholder
+cp .dev.vars.example .dev.vars
 npm run dev
 ```
 

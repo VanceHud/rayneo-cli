@@ -82,6 +82,10 @@ To use `rayneo` alongside your phone without disrupting mobile sync, **always pr
 
 Let the mobile RayNeo App remain the sole token-refresh authority while the iOS Loon plugin ([`loon/`](./loon/README.md)) passively mirrors the active `access_token` and safe client headers to your private Token Broker ([`broker/`](./broker/README.md) — Cloudflare Workers or self-hosted Go server). No `refreshToken` is ever captured, transmitted, or stored:
 
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/VanceHud/rayneo-cli/tree/main/broker/cloudflare)
+
+> Click above for one-click deployment to your own Cloudflare account (Workers Free & Paid plans supported via SQLite Durable Objects; Cloudflare will prompt you for `BROKER_SECRET` — generate one with `openssl rand -hex 32`). For self-hosted Go server instructions, see [`broker/README.md`](./broker/README.md).
+
 ```bash
 # 1) Bind your private broker once and fetch the latest token (saved to 0600 config.json; -verify checks live)
 rayneo sync -url https://your-broker.workers.dev -secret <your-broker-secret> -verify

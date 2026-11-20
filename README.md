@@ -82,6 +82,10 @@ npx skills add VanceHud/rayneo-cli
 
 手机端 RayNeo App 照常负责自动续期，iOS Loon 插件（[`loon/`](./loon/README.md)）在后台被动镜像最新 `access_token` 与安全客户端头至你的私有 Token Broker（[`broker/`](./broker/README.md)，支持免费版 Cloudflare Workers + SQLite Durable Object 或单二进制 Go 服务），全程**绝不采集、存储或传输 `refreshToken`**：
 
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/VanceHud/rayneo-cli/tree/main/broker/cloudflare)
+
+> 点击上方按钮即可一键部署个人 Cloudflare Worker Broker（部署页会自动提示填写自定义 `BROKER_SECRET`，建议先用 `openssl rand -hex 32` 生成；国内使用建议部署后在 Cloudflare 后台绑定一个自定义域名以实现免代理直连）。也可选择自托管零依赖 Go 服务端，详见 [`broker/README.md`](./broker/README.md)。
+
 ```bash
 # 1) 一次性绑定私有 Broker 并拉取最新 Token（保存至 0600 权限的 config.json，支持 -verify 实时校验）
 rayneo sync -url https://your-broker.workers.dev -secret <your-broker-secret> -verify
