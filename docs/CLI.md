@@ -2,7 +2,7 @@
 
 [返回中文主页](../README.md) · [English README](../README_EN.md) · [安全策略](../SECURITY.md)
 
-本文档提供 `rayneo` 全部 **24 个子命令**、全局开关、环境变量、双存储引擎转录架构、本地磁盘缓存策略以及 `TCL1-HMAC-SHA256` 网关签名协议的完整说明。
+本文档提供 `rayneo` 全部 **25 个子命令**、全局开关、环境变量、方案 A（被动 Token Broker）自动同步机制、双存储引擎转录架构、本地磁盘缓存策略以及 `TCL1-HMAC-SHA256` 网关签名协议的完整说明。
 
 ---
 
@@ -10,7 +10,7 @@
 
 - [快速开始](#快速开始)
 - [安装与构建](#安装与构建)
-- [命令一览（24 个子命令）](#命令一览24-个子命令)
+- [命令一览（25 个子命令）](#命令一览25-个子命令)
 - [全局开关与环境变量](#全局开关与环境变量)
 - [输出与管道处理](#输出与管道处理)
 - [批量导出与报告合成](#批量导出与报告合成)
@@ -27,15 +27,34 @@
 
 ## 快速开始
 
-### 方式一：从 `.har` 抓包提取 Token（强烈推荐，不顶掉手机登录）
+### 方式一：方案 A · Token Broker + Loon 自动同步（强烈推荐，长期免手工抓包且不顶号）
 
-服务端在短信验证码重登（`/identify/quickLogin`）时会作废其他设备的 `refreshToken`，且调用 `/authapi/token/refresh` 续期会**立即作废**手机端正在使用的旧 `access_token`。因此日常与手机 App 共用时，推荐从抓包工具（Loon / Reqable / Proxyman / Charles 等导出的 `.har`，详见 [抓包指南](../skills/rayneo-cli/references/har-capture-guide.md)）直接提取当前活跃的 `xtcl-access-token`：
+服务端在短信验证码重登（`/identify/quickLogin`）时会作废其他设备的 `refreshToken`，且调用 `/authapi/token/refresh` 续期会**立即作废**手机端正在使用的旧 `access_token`。方案 A 将手机端 RayNeo App 保留为唯一的续期权威，由 iOS Loon 插件（[`loon/`](../loon/README.md)）将被动观测到的最新 `access_token` 与安全设备头镜像至私有 Token Broker（[`broker/`](../broker/README.md)，支持 Cloudflare Workers 或自托管 Go 服务），全链路**零 `refreshToken` 接触**：
+
+```bash
+# 1) 一次性绑定私有 Broker 并立即拉取（凭证写入 0600 权限的 config.json，强制 no_refresh=true 并清空 refresh_token）
+rayneo sync -url https://your-broker.workers.dev -secret <your-broker-secret> -verify
+
+# 2) 开始查询（若本地 Token 缺失或已过期，请求前自动静默拉取；若遇 401，自动强制拉取新 Token 并透明重试一次）
+rayneo count
+rayneo events -date 2026-11-01
+
+# 3) 查看状态 / 手动同步 / 清除 Broker 配置
+rayneo sync -status     # 查看 Broker URL、脱敏密钥、Token 指纹、来源与过期状态
+rayneo sync             # 携带 If-None-Match ETag 条件同步（未变化返回 304）
+rayneo sync -force      # 跳过 ETag 强制全量拉取
+rayneo sync -clear      # 清除 config.json 中的 broker_url / broker_secret / broker_etag
+```
+
+### 方式二：从 `.har` 抓包提取 Token（零部署推荐，不顶掉手机登录）
+
+无需部署 Broker 时，可直接从抓包工具（Loon / Reqable / Proxyman / Charles 等导出的 `.har`，详见 [抓包指南](../skills/rayneo-cli/references/har-capture-guide.md)）提取当前活跃的 `xtcl-access-token`：
 
 ```bash
 # 1) 持久导入 HAR 中的 token（自动清空 refreshToken 并开启 no_refresh，绝不触发续期）
 rayneo har ./capture.har -verify
 
-# 或者单次临时使用（不改写 config.json，同样绝不刷新 token）
+# 或者单次临时使用（不改写 config.json，跳过 Broker 自动同步，同样绝不刷新 token）
 rayneo -har ./capture.har events -date 2026-11-01
 
 # 2) 开始查询
@@ -43,7 +62,7 @@ rayneo count
 rayneo events -date 2026-11-01
 ```
 
-### 方式二：短信验证码独立登录（备选）
+### 方式三：短信验证码独立登录（备选）
 
 ```bash
 # 1) 发送验证码（area 需带 + 号）
@@ -58,7 +77,7 @@ rayneo events -date 2026-11-01
 rayneo journal | jq -r '.data[0].context' | head -20
 ```
 
-> **续期行为差异**：短信登录模式下 `access_token` 有效期约 2 小时，默认过期自动续期（传 `-no-refresh` 可关闭续期）。HAR 模式下**永久禁用续期**，待手机端 token 过期或轮换后重新抓包执行 `rayneo har ./capture.har -verify` 即可。
+> **续期行为差异**：短信登录模式下 `access_token` 有效期约 2 小时，默认过期自动续期（传 `-no-refresh` 可关闭续期）。Broker 模式与 HAR 模式下**永久禁用 `/authapi/token/refresh` 续期**——Broker 模式下会在 Token 过期或 401 时自动从私有 Broker 拉取手机端最新同步的 Token；HAR 模式下待 Token 过期后重新抓包执行 `rayneo har ./capture.har -verify` 即可。
 
 ---
 
@@ -87,21 +106,22 @@ go build -trimpath -o ./bin/rayneo ./cmd/rayneo
 
 ---
 
-## 命令一览（24 个子命令）
+## 命令一览（25 个子命令）
 
 运行 `rayneo help` 查看终端帮助，`rayneo help --json` 输出完整机器可读规格。
 
-### 1. 认证与配置（7 个）
+### 1. 认证与配置（8 个）
 
 | 子命令 | 接口 / 动作 | 说明 |
 |---|---|---|
-| `har <file.har> [-verify] [-dry-run]` | 本地解析（可选 `GET /lifelog/api/v1/count` 验证） | **【优先推荐】** 从 `.har` 抓包提取最新有效 `xtcl-access-token` 与安全设备头并保存；自动清空 `refreshToken` 且设置 `no_refresh=true`（别名：`import-har`、`from-har`） |
+| `sync [-url url] [-secret sec] [-force] [-verify] \| -status \| -clear` | `GET <broker>/v1/token`（`-verify` 额外调用 `GET /profileapi/v1/profile/query`） | **【优先推荐·自动同步】** 配置或从方案 A Token Broker 拉取最新 `access_token` 与安全设备头（支持 `If-None-Match` ETag `304`、强制 `no_refresh=true`、清空 `refresh_token`）；`-status` 查看脱敏配置与有效期；`-clear` 清除 Broker 配置 |
+| `har <file.har> [-verify] [-dry-run]` | 本地解析（可选 `GET /lifelog/api/v1/count` 验证） | **【优先推荐·零部署】** 从 `.har` 抓包提取最新有效 `xtcl-access-token` 与安全设备头并保存；自动清空 `refreshToken` 且设置 `no_refresh=true`（别名：`import-har`、`from-har`） |
 | `sendcode -account <phone> [-area +86]` | `POST /identify/common/sendVerifyCode` | 请求发送短信登录验证码 |
 | `login -account <phone> -code <code> [-area +86] [-country cn]` | `POST /identify/quickLogin` | 短信验证码登录并保存会话（也支持 `login -har <file.har>` 免刷新导入） |
-| `refresh` | `POST /authapi/token/refresh` | 手动续期 `access_token`（HAR / `no_refresh` 模式下会被拦截，防止踢掉手机端） |
-| `whoami` | 本地只读 | 查看当前网关地址、区域、脱敏账号、Token 掩码、来源、续期策略与 `deviceId` |
-| `logout` | 本地修改 | 清空本地保存的 Token、账号与客户端标识头（不清理磁盘缓存） |
-| `config [-base url] [-region cn\|us\|sg\|eu] [-token tok] [-har file] [-no-refresh]` | 本地修改 | 更新网关 Base URL、区域、手动写入 Token 或切换 `no_refresh` 开关 |
+| `refresh` | `POST /authapi/token/refresh` | 手动续期 `access_token`（Broker / HAR / `no_refresh` 模式下会被拦截，防止踢掉手机端） |
+| `whoami` | 本地只读 | 查看当前网关地址、区域、脱敏账号、Token 掩码、来源、过期时间、Broker 脱敏状态、续期策略与 `deviceId` |
+| `logout` | 本地修改 | 清空本地保存的 Token、过期时间、ETag、账号与客户端标识头（不清理磁盘缓存与 Broker 地址） |
+| `config [-base url] [-region cn\|us\|sg\|eu] [-token tok] [-har file] [-broker-url url] [-broker-secret sec] [-no-refresh]` | 本地修改 | 更新网关 Base URL、区域、手动写入 Token、Broker 配置（输出自动脱敏密钥）或切换 `no_refresh` 开关 |
 
 ### 2. 业务查询（9 个，全部严格只读）
 
@@ -149,23 +169,27 @@ go build -trimpath -o ./bin/rayneo ./cmd/rayneo
 全局开关可放在子命令之前或之后：
 
 ```text
--version          打印当前二进制版本号（如 rayneo 0.1.0 或 rayneo dev）并退出
--har <file.har>   本次运行直接从 .har 提取 token 使用（不修改 config.json，且绝不刷新 token）
--no-refresh       禁止调用 /authapi/token/refresh 续期（避免旧 access_token 作废影响其他设备）
--debug            在 stderr 打印 canonicalRequest / stringToSign / Authorization，并标注缓存命中
--refresh          忽略本地磁盘缓存，强制走网络拉取最新数据（注意：仅刷新缓存，与 token 续期无关！）
--no-cache         本次运行完全不使用本地磁盘缓存（既不读也不写）
--cache-ttl 72h    自定义本次请求的缓存 TTL（Go duration 格式，如 30m、72h）
--H 'K: v'         追加或覆盖请求头（可重复指定，用于查询命令与 raw）
--q k=v            追加 URL 查询参数（可重复指定，同名键可重复以传递数组参数）
+-version             打印当前二进制版本号（如 rayneo 0.1.0 或 rayneo dev）并退出
+-broker-url <url>    本次运行临时覆盖 Token Broker 地址（优先于 RAYNEO_BROKER_URL 与 config.json）
+-broker-secret <sec> 本次运行临时覆盖 Token Broker Bearer 密钥（优先于 RAYNEO_BROKER_SECRET 与 config.json）
+-har <file.har>      本次运行直接从 .har 提取 token 使用（不修改 config.json，跳过 Broker 自动同步且绝不刷新 token）
+-no-refresh          禁止调用 /authapi/token/refresh 续期（避免旧 access_token 作废影响其他设备）
+-debug               在 stderr 打印 canonicalRequest / stringToSign / Authorization，并标注缓存命中
+-refresh             忽略本地磁盘缓存，强制走网络拉取最新数据（注意：仅刷新缓存，与 token 续期无关！）
+-no-cache            本次运行完全不使用本地磁盘缓存（既不读也不写）
+-cache-ttl 72h       自定义本次请求的缓存 TTL（Go duration 格式，如 30m、72h）
+-H 'K: v'            追加或覆盖请求头（可重复指定，用于查询命令与 raw）
+-q k=v               追加 URL 查询参数（可重复指定，同名键可重复以传递数组参数）
 ```
 
-> **常见易混点**：全局开关 `-refresh` 仅表示「跳过本地磁盘缓存重新查询服务器」（完全安全）；而子命令 `rayneo refresh` 表示「调用网关刷新登录令牌」（在 HAR 模式下被禁用）。
+> **常见易混点**：全局开关 `-refresh` 仅表示「跳过本地磁盘缓存重新查询服务器」（完全安全）；而子命令 `rayneo refresh` 表示「调用网关刷新登录令牌」（在 Broker / HAR 模式下被禁用）。
 
 ### 环境变量
 
 | 环境变量 | 作用 |
 |---|---|
+| `RAYNEO_BROKER_URL=<url>` | 方案 A Token Broker 地址（如 `https://your-broker.workers.dev`，优先于 `config.json`） |
+| `RAYNEO_BROKER_SECRET=<sec>` | 方案 A Token Broker Bearer 鉴权密钥（优先于 `config.json`，不回显明文） |
 | `RAYNEO_HAR=<file.har>` | 等同于全局传入 `-har <file.har>`，单次免落盘使用抓包中的 Token |
 | `RAYNEO_TOKEN=<token>` | 直接使用指定 `xtcl-access-token`（自动启用 `no_refresh`，不修改 `config.json`） |
 | `RAYNEO_NO_REFRESH=1` | 强制关闭自动续期（等同于 `-no-refresh`） |
@@ -394,8 +418,8 @@ Authorization: TCL1-HMAC-SHA256 Credential=<appId>,SignedHeaders=xtcl-nonce;xtcl
 rayneo help --json
 ```
 
-输出包含全部 24 个子命令的名称、功能说明、参数列表与默认值、对应 HTTP 方法与路径、示例及 `read_only` 布尔标记：
-- `read_only: false` 仅限认证/配置/调试类命令：`har`、`sendcode`、`login`、`refresh`、`logout`、`config`、`raw`。
+输出包含全部 25 个子命令的名称、功能说明、参数列表与默认值、对应 HTTP 方法与路径、示例及 `read_only` 布尔标记：
+- `read_only: false` 仅限认证/配置/调试类命令：`sync`、`har`、`sendcode`、`login`、`refresh`、`logout`、`config`、`raw`。
 - 其余 17 个查询、转录、导出、报告、缓存与帮助命令均为 `read_only: true`。
 
 ---
@@ -409,8 +433,12 @@ rayneo help --json
   "base_url": "https://xr-api-p.rayneo.cn",
   "access_token": "<redacted-jwt>",
   "no_refresh": true,
-  "token_source": "har:capture.har",
-  "token_captured_at": "2026-11-01T10:00:00+08:00",
+  "token_source": "broker:loon:refresh",
+  "token_captured_at": "2026-11-20T11:30:00Z",
+  "token_expires_at": "2026-11-20T13:30:00Z",
+  "broker_url": "https://your-broker.workers.dev",
+  "broker_secret": "<redacted-broker-secret>",
+  "broker_etag": "\"rev-1-0123456789ab\"",
   "account": "13800000000",
   "account_id": 100000000000001,
   "region": "cn",
@@ -425,7 +453,7 @@ rayneo help --json
 多账号隔离可通过指定 `XDG_CONFIG_HOME` 实现：
 
 ```bash
-XDG_CONFIG_HOME="$HOME/.config/rayneo-work" rayneo har ./work-capture.har -verify
+XDG_CONFIG_HOME="$HOME/.config/rayneo-work" rayneo sync -url https://work-broker.workers.dev -secret <secret> -verify
 XDG_CONFIG_HOME="$HOME/.config/rayneo-work" rayneo whoami
 ```
 
@@ -436,17 +464,20 @@ XDG_CONFIG_HOME="$HOME/.config/rayneo-work" rayneo whoami
 ```text
 rayneo-cli/
 ├── cmd/rayneo/                # CLI 入口包（go install github.com/VanceHud/rayneo-cli/cmd/rayneo@latest）
-│   ├── main.go                # 命令路由、HAR 免刷新守卫、查询与批量导出
-│   ├── main_test.go           # HAR 模式遇 401 绝不触发续期的回归测试
+│   ├── main.go                # 命令路由、Broker/HAR 免刷新守卫、自动同步与 401 重试、查询与导出
+│   ├── main_test.go           # sync 生命周期、Broker 401 自动恢复与 HAR 免刷新回归测试
 │   ├── full.go                # /events/{id}/full 对话转录解析与多格式渲染
 │   ├── transcript.go          # aiTask 录音转录解析与多格式渲染
 │   └── help.go                # help --json 规格、CSV / Markdown / 汇总报告生成
 ├── internal/
 │   ├── api/client.go          # 签名 HTTP 客户端、设备头镜像、缓存读写与自动解压
+│   ├── broker/                # 方案 A Token Broker HTTP 客户端、ETag 处理、Header 白名单与 Config 合并
 │   ├── cache/cache.go         # 本地磁盘缓存与分级 TTL 策略
-│   ├── config/config.go       # 0600 配置文件持久化与 XDG 路径解析
+│   ├── config/config.go       # 0600 配置文件持久化、Broker 环境变量解析与 XDG 路径
 │   ├── har/                   # 从 .har 抓包中筛选最新有效 Token 与安全客户端头
 │   └── sign/                  # TCL1-HMAC-SHA256 签名实现与环境变量覆盖支持
+├── broker/                    # 方案 A Token Broker 服务端（Cloudflare Workers + DO 与自托管 Go 服务）
+├── loon/                      # 方案 A iOS Loon 被动同步插件与测试套件
 ├── skills/rayneo-cli/         # 可移植 AI Agent Skill（SKILL.md + HAR 抓包参考指南）
 ├── scripts/install-skill.sh   # 本地 Skill 安装脚本（支持 copy / symlink）
 ├── docs/CLI.md                # 本参考手册
@@ -460,9 +491,11 @@ rayneo-cli/
 
 | 现象 / 报错 | 原因分析与处理办法 |
 |---|---|
-| `{"code":401,"msg":"Missing token"}` | 本地尚未配置凭证 → **优先**运行 `rayneo har ./capture.har -verify`（或备选 `login`） |
-| `{"code":401,"msg":"Authentication failed"}` | `access_token` 已满约 2 小时过期，或手机 App 自身刷新导致旧 Token 轮换 → 重新抓包运行 `rayneo har ./capture.har -verify` |
-| `token refresh is disabled (no-refresh / HAR mode)` | 免刷新保护机制生效，阻止调用 `/authapi/token/refresh` 踢掉手机端登录；请重新抓包导入新 `.har` |
+| `{"code":401,"msg":"Missing token"}` | 本地尚未配置凭证 → **优先**运行 `rayneo sync -url <url> -secret <secret> -verify` 或 `rayneo har ./capture.har -verify` |
+| `{"code":401,"msg":"Authentication failed"}` | `access_token` 已满约 2 小时过期，或手机 App 自身刷新导致旧 Token 轮换 → Broker 模式下 CLI 会自动拉取并重试；若 Broker 仍为旧 Token，请打开/唤醒手机端雷鸟 App（保持 Loon 运行）后重试；HAR 模式下请重新抓包执行 `rayneo har ./capture.har -verify` |
+| `broker has no token synced yet`（Broker 返回 `404`） | Broker 刚部署完成或已被清空，尚未收到手机端 Loon 推送 → 保持 Loon 插件开启并在手机上打开雷鸟 App 刷新一下页面，再执行 `rayneo sync -verify` |
+| `broker authentication failed (401 Unauthorized)` | `broker_secret` 不匹配 → 检查 `rayneo sync -url ... -secret ...`、环境变量 `RAYNEO_BROKER_SECRET` 与 Broker 服务端 `BROKER_SECRET` 是否一致 |
+| `token refresh is disabled (no-refresh / broker / HAR mode)` | 免刷新保护机制生效，阻止调用 `/authapi/token/refresh` 踢掉手机端登录；请使用 `rayneo sync` 或重新导入 `.har` |
 | Kong 返回 HTML `401 Authorization Required` | 请求签名未通过网关校验（常见原因是手动传入 `-H` 意外覆盖了 `xtcl-nonce` 或 `xtcl-timestamp`，或客户端签名密钥变更） |
 | 短信登录模式下 `rayneo refresh` 也报 `401` | 手机端重新登录使旧 `refreshToken` 失效 → 建议改用 `rayneo har ./capture.har -verify` |
 | `{"code":404,"msg":"No static resource …"}` | 使用 `raw -p` 时误传了客户端页面路由而非后端 REST 路径 |

@@ -75,7 +75,7 @@ func listAITasks(cl *api.Client, taskType string, pageSize int) ([]aiTaskRow, er
 	if taskType != "" {
 		payload["taskType"] = taskType
 	}
-	_, body, err := cl.Call("POST", "/clsapi/aiTask/v2/selectPage", nil, payload)
+	_, body, err := callWithAuth(cl, "POST", "/clsapi/aiTask/v2/selectPage", nil, payload)
 	if err != nil {
 		return nil, err
 	}
@@ -97,7 +97,7 @@ func listAITasks(cl *api.Client, taskType string, pageSize int) ([]aiTaskRow, er
 
 // fetchTranscript pulls the full transcript for one taskId.
 func fetchTranscript(cl *api.Client, taskID string) (*transcriptBundle, error) {
-	_, body, err := cl.Call("POST", "/clsapi/aiTask/getDataAllByTaskId", nil,
+	_, body, err := callWithAuth(cl, "POST", "/clsapi/aiTask/getDataAllByTaskId", nil,
 		map[string]any{"taskIds": []string{taskID}})
 	if err != nil {
 		return nil, err

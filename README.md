@@ -22,7 +22,9 @@ $ rayneo events -date 2026-11-01 | jq -r '.data.events[] | "\(.startTimeFormatte
 ## 核心特性
 
 - **纯 Go 标准库单二进制**：零第三方依赖，编译产物仅单个 `rayneo` 可执行文件，原生支持 macOS、Linux、Windows（`amd64` / `arm64`）。
-- **HAR 免刷新无感鉴权（强烈推荐）**：直接从手机抓包文件（`.har`）提取当前活跃的 `xtcl-access-token` 与设备标识头，自动清空 `refreshToken` 并开启 `no_refresh` 保护，**绝不把手机端 App 顶下线**。
+- **免刷新不顶号双鉴权（Broker 自动同步 + HAR 抓包）**：
+  - **方案 A · 被动 Token Broker 自动同步（推荐）**：搭配 iOS Loon 插件与个人 Token Broker（支持 Cloudflare Workers 或自托管 Go 服务），手机端 RayNeo App 始终是唯一续期方，Loon 仅被动镜像活跃 `access_token`（绝不触碰 `refreshToken`）；CLI 通过 `rayneo sync` 自动拉取并在过期/401 时无感重试，**永不把手机端 App 顶下线**。
+  - **`.har` 抓包导入（零部署备选）**：直接从抓包文件提取当前活跃 `xtcl-access-token` 与安全设备头，自动清空 `refreshToken` 并开启 `no_refresh` 保护。
 - **双存储引擎转录自动合并**：一条 `rayneo full` 命令自动打通全天智记对话存储（`/lifelog/api/v1/events/{id}/full`）与独立录音任务存储（`/clsapi/aiTask/getDataAllByTaskId`），支持输出带说话人标签、毫秒级时间戳与译文的 `md` / `txt` / `srt` / `json` 四种格式。
 - **智能本地磁盘缓存**：历史日期响应默认落盘缓存 30 天（`0600` 权限），重复查询与重跑批量导出实现 **0 网络请求**；支持 `-refresh` 随时强制拉取最新同步数据。
 - **温和限速批量导出**：`rayneo export` 内置 `400ms` 请求间隔，按日期区间一键导出原始 JSON、带 UTF-8 BOM 的 CSV（Excel 直接打开不乱码）及结构化 Markdown，并可通过 `rayneo report` 纯离线合并为月度/阶段汇总报告。
@@ -67,24 +69,47 @@ npx skills add VanceHud/rayneo-cli
 
 ---
 
-## 认证指南（重要：为什么推荐 `.har` 模式）
+## 认证指南（重要：为什么推荐 Broker 自动同步 / `.har` 模式）
 
 雷鸟云端网关存在严格的单会话令牌轮换机制：
 
 1. 调用短信验证码登录（`POST /identify/quickLogin`）会使手机端 App 的 `refreshToken` 失效；
 2. 调用令牌续期（`POST /authapi/token/refresh`）会**立即作废**上一枚 `access_token`，导致手机端 App 瞬间掉线重登。
 
-因此，日常与手机 App 并行使用时，**强烈推荐通过 `.har` 抓包提取当前活跃 Token**（详细抓包步骤见 [`skills/rayneo-cli/references/har-capture-guide.md`](./skills/rayneo-cli/references/har-capture-guide.md)）：
+因此，日常与手机 App 并行使用时，**强烈推荐采用「方案 A：被动 Token Broker 自动同步」或「`.har` 抓包导入」**，两者均强制设置 `no_refresh=true` 且清空 `refresh_token`，彻底杜绝误触续期导致手机掉线：
 
-### 方式一：从 `.har` 抓包导入（推荐，手机端不掉线）
+### 方式一：方案 A · Token Broker + Loon 自动同步（最省心，手机端不掉线）
 
-在手机上使用 Loon / Reqable / Proxyman / Charles 打开雷鸟 App 刷新一次全天智记页面，导出包含 `xr-api-p.rayneo.cn` 请求的 `capture.har`：
+手机端 RayNeo App 照常负责自动续期，iOS Loon 插件（[`loon/`](./loon/README.md)）在后台被动镜像最新 `access_token` 与安全客户端头至你的私有 Token Broker（[`broker/`](./broker/README.md)，支持免费版 Cloudflare Workers + SQLite Durable Object 或单二进制 Go 服务），全程**绝不采集、存储或传输 `refreshToken`**：
+
+```bash
+# 1) 一次性绑定私有 Broker 并拉取最新 Token（保存至 0600 权限的 config.json，支持 -verify 实时校验）
+rayneo sync -url https://your-broker.workers.dev -secret <your-broker-secret> -verify
+
+# 2) 后续所有查询命令完全无感：
+#    - 若本地 Token 缺失或已过 token_expires_at，请求前自动向 Broker 拉取；
+#    - 若接口返回 401，CLI 自动向 Broker 强制拉取新 Token，如有更新则透明重试一次！
+rayneo count
+rayneo events -date 2026-11-01
+
+# 3) 常用 Broker 管理命令
+rayneo sync             # 按 ETag 条件拉取（未变化返回 304 Not Modified）
+rayneo sync -force      # 跳过 ETag 强制全量拉取
+rayneo sync -status     # 查看 Broker 配置（密钥脱敏）、Token 指纹与剩余有效期
+rayneo sync -clear      # 清除本地保存的 Broker 配置
+```
+
+> **提示**：当手机 App 长时间未唤醒且 Token 已过期时，若 Broker 仍为旧 Token，CLI 会在 `stderr` 提示打开/唤醒一次手机上的雷鸟 App（保持 Loon 开启），即可自动同步新 Token。也支持通过环境变量 `RAYNEO_BROKER_URL` / `RAYNEO_BROKER_SECRET` 或全局开关 `-broker-url` / `-broker-secret` 临时覆盖。
+
+### 方式二：从 `.har` 抓包导入（零部署推荐，手机端不掉线）
+
+无需部署任何服务端，在手机上使用 Loon / Reqable / Proxyman / Charles 打开雷鸟 App 刷新一次全天智记页面，导出包含 `xr-api-p.rayneo.cn` 请求的 `capture.har`（详细步骤见 [`skills/rayneo-cli/references/har-capture-guide.md`](./skills/rayneo-cli/references/har-capture-guide.md)）：
 
 ```bash
 # 1) 持久导入（自动清空 refreshToken 并设置 no_refresh=true，保存至 0600 权限的 config.json）
 rayneo har ./capture.har -verify
 
-# 或：单次临时运行（完全不写入 config.json，同样绝不触发续期）
+# 或：单次临时运行（完全不写入 config.json，跳过 Broker 自动同步，绝不触发续期）
 rayneo -har ./capture.har events -date 2026-11-01
 
 # 2) 查看当前会话与保护状态
@@ -93,7 +118,7 @@ rayneo whoami
 
 > **提示**：`access_token` 有效期通常约 2 小时（或随手机 App 自身续期而轮换）。当收到 `401 Authentication failed` 时，重新抓包执行 `rayneo har ./capture.har -verify` 即可；导入成功后建议及时删除本地 `.har` 文件。
 
-### 方式二：短信验证码独立登录（备选）
+### 方式三：短信验证码独立登录（备选）
 
 仅在不介意手机端会话失效时使用：
 
@@ -138,14 +163,15 @@ rayneo report -dir ./rayneo-export -out ./rayneo-export/weekly-report.md -title 
 rayneo events -date 2026-11-01 -refresh
 ```
 
-### 命令速查表（共 24 个子命令）
+### 命令速查表（共 25 个子命令）
 
 完整参数、返回结构、缓存策略与排障指南请查阅 **[`docs/CLI.md`](./docs/CLI.md)**（或运行 `rayneo help --json`）。
 
 | 分类 | 子命令 | 说明 |
 |---|---|---|
-| **认证与配置** | `har` | **【推荐】** 从 `.har` 提取 Token 与设备头（自动开启 `no_refresh`） |
-| | `whoami` / `config` / `logout` | 查看当前会话状态 / 修改网关与区域配置 / 清除本地凭证 |
+| **认证与配置** | `sync` | **【推荐·自动同步】** 绑定或从私有 Token Broker 拉取最新 `access_token`（方案 A，支持 `-verify` / `-force` / `-status` / `-clear`，强制 `no_refresh`） |
+| | `har` | **【推荐·零部署】** 从 `.har` 提取 Token 与设备头（自动开启 `no_refresh`） |
+| | `whoami` / `config` / `logout` | 查看当前会话与 Broker 状态 / 修改网关、区域与 Broker 配置 / 清除本地凭证 |
 | | `sendcode` / `login` / `refresh` | 备选短信验证码登录与手动续期（注意会影响其他在线设备） |
 | **只读查询** | `count` / `calendar` | 全局统计计数 / 月度日历打卡与每日一句话摘要 |
 | | `events` / `event` | 单日事件列表（含 GPS `trailPoints`） / 单事件摘要、提纲与子事件 |

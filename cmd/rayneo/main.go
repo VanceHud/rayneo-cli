@@ -2,9 +2,12 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -13,6 +16,7 @@ import (
 	"time"
 
 	"github.com/VanceHud/rayneo-cli/internal/api"
+	"github.com/VanceHud/rayneo-cli/internal/broker"
 	"github.com/VanceHud/rayneo-cli/internal/cache"
 	"github.com/VanceHud/rayneo-cli/internal/config"
 	"github.com/VanceHud/rayneo-cli/internal/har"
@@ -36,7 +40,7 @@ func printHelp() {
 		title string
 		names []string
 	}{
-		{"auth", []string{"har", "sendcode", "login", "refresh", "whoami", "logout", "config"}},
+		{"auth", []string{"sync", "har", "sendcode", "login", "refresh", "whoami", "logout", "config"}},
 		{"query (read-only)", []string{"count", "calendar", "events", "event", "journal", "jd", "suggests", "tasks", "chat"}},
 		{"transcripts (read-only)", []string{"full", "recordings", "transcript"}},
 		{"bulk", []string{"export", "report", "cache"}},
@@ -71,26 +75,50 @@ func printHelp() {
 		fmt.Println()
 	}
 	fmt.Println("global flags:")
-	fmt.Println("  -version          print version and exit")
-	fmt.Println("  -har <file.har>   use access token from a .har capture for this run (never refreshes)")
-	fmt.Println("  -no-refresh       never renew access token via /authapi/token/refresh (protects other devices)")
-	fmt.Println("  -debug            print canonical/stringToSign/authorization and cache hits")
-	fmt.Println("  -refresh          force network (ignore local disk cache)")
-	fmt.Println("  -no-cache         disable cache for this run")
-	fmt.Println("  -cache-ttl 72h    override cache TTL")
-	fmt.Println("  -H 'K: v'         add/override header (repeatable)")
-	fmt.Println("  -q k=v            add query param (repeatable)")
+	fmt.Println("  -version             print version and exit")
+	fmt.Println("  -broker-url <url>    override token broker URL for this run (or RAYNEO_BROKER_URL)")
+	fmt.Println("  -broker-secret <sec> override token broker Bearer secret for this run (or RAYNEO_BROKER_SECRET)")
+	fmt.Println("  -har <file.har>      use access token from a .har capture for this run (never refreshes)")
+	fmt.Println("  -no-refresh          never renew access token via /authapi/token/refresh (protects other devices)")
+	fmt.Println("  -debug               print canonical/stringToSign/authorization and cache hits")
+	fmt.Println("  -refresh             force network (ignore local disk cache)")
+	fmt.Println("  -no-cache            disable cache for this run")
+	fmt.Println("  -cache-ttl 72h       override cache TTL")
+	fmt.Println("  -H 'K: v'            add/override header (repeatable)")
+	fmt.Println("  -q k=v               add query param (repeatable)")
 	fmt.Println("cache policy: past days 30d · today 5m · counts/tasks/chats 10m · auth never")
 	fmt.Println("machine readable: rayneo help --json")
 }
 
 var (
-	cacheEnabled  = true
-	cacheForce    = false
-	cacheTTL      time.Duration
-	harPath       = os.Getenv("RAYNEO_HAR")
-	noRefreshFlag = os.Getenv("RAYNEO_NO_REFRESH") != ""
+	cacheEnabled     = true
+	cacheForce       = false
+	cacheTTL         time.Duration
+	harPath          = os.Getenv("RAYNEO_HAR")
+	noRefreshFlag    = os.Getenv("RAYNEO_NO_REFRESH") != ""
+	brokerURLFlag    = ""
+	brokerSecretFlag = ""
 )
+
+func effectiveBroker(c *config.Config) (url, secret string) {
+	url, secret = c.EffectiveBroker()
+	if u := strings.TrimRight(strings.TrimSpace(brokerURLFlag), "/"); u != "" {
+		url = u
+	}
+	if s := strings.TrimSpace(brokerSecretFlag); s != "" {
+		secret = s
+	}
+	return url, secret
+}
+
+func hasBroker(c *config.Config) bool {
+	u, s := effectiveBroker(c)
+	return u != "" && s != ""
+}
+
+func brokerAutoSyncActive(c *config.Config) bool {
+	return harPath == "" && os.Getenv("RAYNEO_TOKEN") == "" && hasBroker(c)
+}
 
 func loadRawConfig() *config.Config {
 	c, err := config.Load()
@@ -110,6 +138,8 @@ func applyHAR(c *config.Config, path string) (*har.Session, error) {
 	c.RefreshToken = ""
 	c.NoRefresh = true
 	c.TokenSource = "har:" + filepath.Base(path)
+	c.TokenExpiresAt = ""
+	c.BrokerETag = ""
 	if !s.CapturedAt.IsZero() {
 		c.TokenTime = s.CapturedAt.Format(time.RFC3339)
 	} else {
@@ -139,7 +169,7 @@ func applyHAR(c *config.Config, path string) (*har.Session, error) {
 	return s, nil
 }
 
-func mustConfig() *config.Config {
+func loadEffectiveConfig() *config.Config {
 	c := loadRawConfig()
 	if harPath != "" {
 		if _, err := applyHAR(c, harPath); err != nil {
@@ -151,6 +181,7 @@ func mustConfig() *config.Config {
 		c.RefreshToken = ""
 		c.NoRefresh = true
 		c.TokenSource = "env:RAYNEO_TOKEN"
+		c.TokenExpiresAt = ""
 	}
 	if noRefreshFlag {
 		c.NoRefresh = true
@@ -158,14 +189,64 @@ func mustConfig() *config.Config {
 	return c
 }
 
+func maybePreSync(c *config.Config) {
+	if !brokerAutoSyncActive(c) {
+		return
+	}
+	needSync := c.Token == ""
+	if !needSync {
+		if expired, _, ok := broker.ParseExpiry(c.TokenExpiresAt, time.Now()); ok && expired {
+			needSync = true
+		}
+	}
+	if !needSync {
+		return
+	}
+	bURL, bSecret := effectiveBroker(c)
+	ifNoneMatch := ""
+	if c.Token != "" {
+		ifNoneMatch = c.BrokerETag
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	resp, notMod, err := broker.Fetch(ctx, bURL, bSecret, ifNoneMatch)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "broker: pre-sync failed (%v)\n", err)
+		return
+	}
+	if notMod || resp == nil {
+		return
+	}
+	oldTok := c.Token
+	if broker.ApplyToConfig(c, resp) {
+		if serr := c.Save(); serr != nil {
+			fmt.Fprintf(os.Stderr, "broker: save config: %v\n", serr)
+		}
+	}
+	if c.Token != oldTok {
+		fmt.Fprintf(os.Stderr, "broker: synced updated token %s (rev %d, source %s)\n",
+			mask(c.Token), resp.Revision, orDefault(resp.Source, "broker"))
+	}
+}
+
+func mustConfig() *config.Config {
+	c := loadEffectiveConfig()
+	maybePreSync(c)
+	return c
+}
+
 func printJSON(b []byte) {
+	printJSONTo(os.Stdout, b)
+}
+
+func printJSONTo(w io.Writer, b []byte) {
 	var v any
 	if json.Unmarshal(b, &v) == nil {
 		out, _ := json.MarshalIndent(v, "", "  ")
-		fmt.Println(string(out))
+		fmt.Fprintln(w, string(out))
 		return
 	}
-	fmt.Println(string(b))
+	fmt.Fprintln(w, string(b))
 }
 
 type kvFlag []string
@@ -208,6 +289,30 @@ func mask(s string) string {
 	return s[:6] + "…" + s[len(s)-4:]
 }
 
+func maskSecret(s string) string {
+	if s == "" {
+		return "(none)"
+	}
+	if len(s) <= 15 {
+		return "***"
+	}
+	return s[:4] + "…" + s[len(s)-4:]
+}
+
+func orNone(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return "(none)"
+	}
+	return s
+}
+
+func orDefault(s, def string) string {
+	if strings.TrimSpace(s) == "" {
+		return def
+	}
+	return s
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		printHelp()
@@ -234,6 +339,28 @@ func main() {
 			continue
 		case a == "-no-refresh" || a == "--no-refresh":
 			noRefreshFlag = true
+			continue
+		case a == "-broker-url" || a == "--broker-url":
+			if i+1 >= len(rawArgs) {
+				fmt.Fprintln(os.Stderr, "-broker-url needs a URL, e.g. -broker-url https://broker.example.com")
+				os.Exit(2)
+			}
+			brokerURLFlag = rawArgs[i+1]
+			i++
+			continue
+		case strings.HasPrefix(a, "-broker-url=") || strings.HasPrefix(a, "--broker-url="):
+			brokerURLFlag = a[strings.Index(a, "=")+1:]
+			continue
+		case a == "-broker-secret" || a == "--broker-secret":
+			if i+1 >= len(rawArgs) {
+				fmt.Fprintln(os.Stderr, "-broker-secret needs a secret value")
+				os.Exit(2)
+			}
+			brokerSecretFlag = rawArgs[i+1]
+			i++
+			continue
+		case strings.HasPrefix(a, "-broker-secret=") || strings.HasPrefix(a, "--broker-secret="):
+			brokerSecretFlag = a[strings.Index(a, "=")+1:]
 			continue
 		case a == "-har" || a == "--har":
 			if i+1 >= len(rawArgs) {
@@ -298,6 +425,8 @@ func main() {
 			}
 		}
 		printHelp()
+	case "sync":
+		cmdSync(args, debug)
 	case "har", "import-har", "from-har":
 		cmdHar(args, debug)
 	case "event":
@@ -319,11 +448,11 @@ func main() {
 	case "logout":
 		c := loadRawConfig()
 		c.Token, c.RefreshToken, c.Account, c.AccountID = "", "", "", 0
-		c.NoRefresh, c.TokenSource, c.TokenTime, c.ClientHeaders = false, "", "", nil
+		c.NoRefresh, c.TokenSource, c.TokenTime, c.TokenExpiresAt, c.BrokerETag, c.ClientHeaders = false, "", "", "", "", nil
 		_ = c.Save()
 		fmt.Println("token cleared")
 	case "whoami":
-		c := mustConfig()
+		c := loadEffectiveConfig()
 		src := c.TokenSource
 		if src == "" {
 			if c.Token != "" {
@@ -338,11 +467,27 @@ func main() {
 		refState := "disabled (no refreshToken)"
 		if c.NoRefresh {
 			refState = "disabled (no-refresh; keeps other devices logged in)"
+		} else if hasBroker(c) {
+			refState = "disabled (broker mode; keeps other devices logged in)"
 		} else if c.RefreshToken != "" {
 			refState = "auto (" + mask(c.RefreshToken) + ")"
 		}
 		fmt.Printf("base     : %s\nregion   : %s\naccount  : %s\naccountId: %d\ntoken    : %s\nsource   : %s\nrefresh  : %s\ndeviceId : %s\n",
 			c.BaseURL, c.Region, orDash(c.Account), c.AccountID, mask(c.Token), src, refState, c.DeviceID)
+		if c.TokenExpiresAt != "" {
+			expLine := c.TokenExpiresAt
+			if expired, rem, ok := broker.ParseExpiry(c.TokenExpiresAt, time.Now()); ok {
+				if expired {
+					expLine += " (expired)"
+				} else {
+					expLine += fmt.Sprintf(" (remaining %s)", rem.Round(time.Second))
+				}
+			}
+			fmt.Printf("expires  : %s\n", expLine)
+		}
+		if bURL, bSec := effectiveBroker(c); bURL != "" || bSec != "" {
+			fmt.Printf("broker   : %s (secret %s)\n", orNone(bURL), maskSecret(bSec))
+		}
 	case "config":
 		cmdConfig(args)
 	case "count", "calendar", "events", "journal", "story", "journal-detail", "jd", "suggests", "tasks", "chat":
@@ -383,6 +528,232 @@ func reorderPositionalLast(args []string, valueFlags map[string]bool) []string {
 		}
 	}
 	return append(flags, pos...)
+}
+
+func cmdSync(args []string, debug bool) {
+	if code := runSync(args, debug, os.Stdout, os.Stderr); code != 0 {
+		os.Exit(code)
+	}
+}
+
+func runSync(args []string, debug bool, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("sync", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	urlFlag := fs.String("url", "", "token broker base URL (saved to config.json)")
+	secretFlag := fs.String("secret", "", "token broker Bearer secret (saved to config.json)")
+	forceFlag := fs.Bool("force", false, "skip If-None-Match ETag and force full fetch")
+	verifyFlag := fs.Bool("verify", false, "verify synced token live via GET /profileapi/v1/profile/query")
+	statusFlag := fs.Bool("status", false, "show broker configuration and synced token status")
+	clearFlag := fs.Bool("clear", false, "clear broker_url, broker_secret, and broker_etag from config")
+	if err := fs.Parse(reorderPositionalLast(args, map[string]bool{"url": true, "secret": true})); err != nil {
+		return 2
+	}
+	if fs.NArg() > 0 {
+		switch fs.Arg(0) {
+		case "status":
+			*statusFlag = true
+		case "clear":
+			*clearFlag = true
+		default:
+			fmt.Fprintln(stderr, "usage: rayneo sync [-url <url> -secret <secret>] [-force] [-verify] | -status | -clear")
+			return 2
+		}
+	}
+
+	c, err := config.Load()
+	if err != nil {
+		fmt.Fprintln(stderr, "config:", err)
+		return 1
+	}
+
+	if *statusFlag {
+		bURL, bSecret := effectiveBroker(c)
+		expStatus := "(unknown)"
+		if expired, rem, ok := broker.ParseExpiry(c.TokenExpiresAt, time.Now()); ok {
+			if expired {
+				expStatus = "yes (expired)"
+			} else {
+				expStatus = fmt.Sprintf("no (remaining %s)", rem.Round(time.Second))
+			}
+		}
+		refState := "disabled (no_refresh=true)"
+		if !c.NoRefresh {
+			if hasBroker(c) {
+				refState = "disabled (broker mode)"
+			} else if c.RefreshToken != "" {
+				refState = "auto (" + mask(c.RefreshToken) + ")"
+			} else {
+				refState = "disabled (no refreshToken)"
+			}
+		}
+		fmt.Fprintf(stdout,
+			"broker    : %s\nsecret    : %s\netag      : %s\ntoken     : %s\ntokenFp   : %s\nsource    : %s\ncaptured  : %s\nexpiresAt : %s\nexpired   : %s\nrefresh   : %s\n",
+			orNone(bURL), maskSecret(bSecret), orNone(c.BrokerETag), mask(c.Token),
+			orNone(broker.TokenFingerprint(c.Token)), orNone(c.TokenSource),
+			orNone(c.TokenTime), orNone(c.TokenExpiresAt), expStatus, refState,
+		)
+		return 0
+	}
+
+	if *clearFlag {
+		c.BrokerURL = ""
+		c.BrokerSecret = ""
+		c.BrokerETag = ""
+		if err := c.Save(); err != nil {
+			fmt.Fprintln(stderr, "config:", err)
+			return 1
+		}
+		fmt.Fprintln(stdout, "broker config cleared (broker_url, broker_secret, broker_etag removed)")
+		return 0
+	}
+
+	saveBroker := false
+	if u := strings.TrimRight(strings.TrimSpace(*urlFlag), "/"); u != "" {
+		if strings.TrimRight(strings.TrimSpace(c.BrokerURL), "/") != u {
+			c.BrokerETag = ""
+		}
+		c.BrokerURL = u
+		saveBroker = true
+	}
+	if s := strings.TrimSpace(*secretFlag); s != "" {
+		c.BrokerSecret = s
+		saveBroker = true
+	}
+
+	bURL, bSecret := effectiveBroker(c)
+	if u := strings.TrimRight(strings.TrimSpace(*urlFlag), "/"); u != "" {
+		bURL = u
+	}
+	if s := strings.TrimSpace(*secretFlag); s != "" {
+		bSecret = s
+	}
+	if bURL == "" || bSecret == "" {
+		fmt.Fprintln(stderr, "sync: broker not configured — pass -url <url> -secret <secret> (or set RAYNEO_BROKER_URL and RAYNEO_BROKER_SECRET)")
+		return 2
+	}
+
+	ifNoneMatch := ""
+	if !*forceFlag && c.BrokerETag != "" && c.Token != "" {
+		ifNoneMatch = c.BrokerETag
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	resp, notMod, err := broker.Fetch(ctx, bURL, bSecret, ifNoneMatch)
+	cancel()
+	if err != nil {
+		if errors.Is(err, broker.ErrNoToken) {
+			if saveBroker {
+				c.NoRefresh = true
+				c.RefreshToken = ""
+				if serr := c.Save(); serr != nil {
+					fmt.Fprintln(stderr, "config:", serr)
+					return 1
+				}
+				fmt.Fprintln(stderr, "sync: broker config saved, but broker has no token synced yet — open/wake the RayNeo App on your phone (with Loon running) and retry `rayneo sync`")
+				return 1
+			}
+			fmt.Fprintln(stderr, "sync: broker has no token synced yet — open/wake the RayNeo App on your phone (with Loon running) and retry `rayneo sync`")
+			return 1
+		}
+		if errors.Is(err, broker.ErrUnauthorized) {
+			fmt.Fprintln(stderr, "sync: broker authentication failed (401 Unauthorized) — check -secret or RAYNEO_BROKER_SECRET")
+			return 1
+		}
+		fmt.Fprintln(stderr, "sync:", err)
+		return 1
+	}
+
+	if notMod {
+		needSave := saveBroker
+		if !c.NoRefresh {
+			c.NoRefresh = true
+			needSave = true
+		}
+		if c.RefreshToken != "" {
+			c.RefreshToken = ""
+			needSave = true
+		}
+		if needSave {
+			if serr := c.Save(); serr != nil {
+				fmt.Fprintln(stderr, "config:", serr)
+				return 1
+			}
+		}
+		expInfo := orNone(c.TokenExpiresAt)
+		if expired, rem, ok := broker.ParseExpiry(c.TokenExpiresAt, time.Now()); ok {
+			if expired {
+				expInfo += " (EXPIRED)"
+			} else {
+				expInfo += fmt.Sprintf(" (remaining %s)", rem.Round(time.Second))
+			}
+		}
+		fmt.Fprintf(stdout, "unchanged (304 Not Modified) from %s:\n", bURL)
+		fmt.Fprintf(stdout, "  token    : %s (fp %s)\n  source   : %s\n  expires  : %s\n  refresh  : disabled (no_refresh=true)\n",
+			mask(c.Token), orNone(broker.TokenFingerprint(c.Token)), orNone(c.TokenSource), expInfo)
+	} else {
+		broker.ApplyToConfig(c, resp)
+		if err := c.Save(); err != nil {
+			fmt.Fprintln(stderr, "config:", err)
+			return 1
+		}
+		ttlStr := formatRemaining(resp)
+		fp := resp.TokenFP
+		if fp == "" {
+			fp = broker.TokenFingerprint(c.Token)
+		}
+		fmt.Fprintf(stdout, "synced from %s (rev %d, source %s):\n", bURL, resp.Revision, orDefault(resp.Source, "broker"))
+		fmt.Fprintf(stdout, "  token    : %s (fp %s)\n  expires  : %s (%s)\n  base     : %s\n  region   : %s\n  accountId: %d\n  deviceId : %s\n  refresh  : disabled (no_refresh=true, refreshToken cleared; protects other devices)\n",
+			mask(c.Token), orNone(fp), orNone(c.TokenExpiresAt), ttlStr,
+			c.BaseURL, c.Region, c.AccountID, c.DeviceID)
+		if resp.Expired {
+			fmt.Fprintln(stderr, "warning: synced token is already expired — open/wake the RayNeo App on your phone (with Loon running) to sync a fresh token")
+		}
+	}
+
+	if *verifyFlag {
+		cl := api.New(c)
+		cl.Dump = debug
+		vResp, vBody, vErr := cl.Call("GET", "/profileapi/v1/profile/query", nil, nil)
+		if vErr != nil {
+			fmt.Fprintln(stderr, "verify error:", vErr)
+			return 1
+		}
+		if authExpired(vBody) || vResp.StatusCode == http.StatusUnauthorized {
+			fmt.Fprintf(stderr, "verify failed: HTTP %d (synced token has expired on server; open/wake the RayNeo App on your phone to sync a fresh token)\n", vResp.StatusCode)
+			printJSONTo(stdout, vBody)
+			return 1
+		}
+		if vResp.StatusCode >= 400 {
+			fmt.Fprintf(stderr, "verify failed: HTTP %d\n", vResp.StatusCode)
+			printJSONTo(stdout, vBody)
+			return 1
+		}
+		fmt.Fprintf(stdout, "  verified : HTTP %d OK (/profileapi/v1/profile/query)\n", vResp.StatusCode)
+	}
+	return 0
+}
+
+func formatRemaining(resp *broker.TokenResponse) string {
+	if resp == nil {
+		return "unknown"
+	}
+	if resp.Expired {
+		return "EXPIRED"
+	}
+	est := ""
+	if resp.ExpiresEstimated {
+		est = ", estimated"
+	}
+	if resp.RemainingSeconds > 0 {
+		return fmt.Sprintf("remaining %s%s", (time.Duration(resp.RemainingSeconds) * time.Second).String(), est)
+	}
+	if expired, rem, ok := broker.ParseExpiry(resp.ExpiresAt, time.Now()); ok {
+		if expired {
+			return "EXPIRED"
+		}
+		return fmt.Sprintf("remaining %s%s", rem.Round(time.Second).String(), est)
+	}
+	return "unknown"
 }
 
 func cmdHar(args []string, debug bool) {
@@ -444,18 +815,33 @@ func cmdHar(args []string, debug bool) {
 }
 
 func cmdConfig(args []string) {
-	fs := flag.NewFlagSet("config", flag.ExitOnError)
+	if code := runConfig(args, os.Stdout, os.Stderr); code != 0 {
+		os.Exit(code)
+	}
+}
+
+func runConfig(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("config", flag.ContinueOnError)
+	fs.SetOutput(stderr)
 	base := fs.String("base", "", "base URL")
 	region := fs.String("region", "", "cn|us|sg|eu")
 	token := fs.String("token", "", "access token (disables auto-refresh)")
 	harFlag := fs.String("har", "", "import access token from .har file (disables auto-refresh)")
+	brokerURLOpt := fs.String("broker-url", "", "token broker URL")
+	brokerSecretOpt := fs.String("broker-secret", "", "token broker Bearer secret")
 	noRefresh := fs.Bool("no-refresh", false, "disable token refresh and clear stored refreshToken")
-	_ = fs.Parse(args)
-	c := loadRawConfig()
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	c, err := config.Load()
+	if err != nil {
+		fmt.Fprintln(stderr, "config:", err)
+		return 1
+	}
 	if h := firstNonEmpty(*harFlag, harPath); h != "" {
 		if _, err := applyHAR(c, h); err != nil {
-			fmt.Fprintln(os.Stderr, "har:", err)
-			os.Exit(1)
+			fmt.Fprintln(stderr, "har:", err)
+			return 1
 		}
 	}
 	if *base != "" {
@@ -470,16 +856,35 @@ func cmdConfig(args []string) {
 		c.NoRefresh = true
 		c.TokenSource = "manual"
 		c.TokenTime = time.Now().Format(time.RFC3339)
+		c.TokenExpiresAt = ""
+		c.BrokerETag = ""
+	}
+	if u := strings.TrimRight(strings.TrimSpace(firstNonEmpty(*brokerURLOpt, brokerURLFlag)), "/"); u != "" {
+		if strings.TrimRight(strings.TrimSpace(c.BrokerURL), "/") != u {
+			c.BrokerETag = ""
+		}
+		c.BrokerURL = u
+	}
+	if s := strings.TrimSpace(firstNonEmpty(*brokerSecretOpt, brokerSecretFlag)); s != "" {
+		c.BrokerSecret = s
 	}
 	if *noRefresh || noRefreshFlag {
 		c.NoRefresh = true
 		c.RefreshToken = ""
 	}
 	if err := c.Save(); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		fmt.Fprintln(stderr, err)
+		return 1
 	}
-	fmt.Printf("saved: base=%s region=%s token=%s noRefresh=%v\n", c.BaseURL, c.Region, mask(c.Token), c.NoRefresh)
+	bURL, bSec := effectiveBroker(c)
+	if bURL != "" || bSec != "" {
+		fmt.Fprintf(stdout, "saved: base=%s region=%s token=%s noRefresh=%v broker=%s brokerSecret=%s\n",
+			c.BaseURL, c.Region, mask(c.Token), c.NoRefresh, orNone(bURL), maskSecret(bSec))
+	} else {
+		fmt.Fprintf(stdout, "saved: base=%s region=%s token=%s noRefresh=%v\n",
+			c.BaseURL, c.Region, mask(c.Token), c.NoRefresh)
+	}
+	return 0
 }
 
 func newClient(c *config.Config, debug bool, extra map[string]string) *api.Client {
@@ -507,7 +912,7 @@ func cmdSendCode(args []string, debug bool) {
 		"areaCode": *area, "runtimeType": "phone",
 		"validate": nil, "sceneType": 2,
 	}
-	cl := newClient(mustConfig(), debug, headers(hs))
+	cl := newClient(loadEffectiveConfig(), debug, headers(hs))
 	resp, body, err := cl.Call("POST", "/identify/common/sendVerifyCode", nil, payload)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -590,6 +995,8 @@ func cmdLogin(args []string, debug bool) {
 	}
 	c.TokenSource = "login"
 	c.TokenTime = time.Now().Format(time.RFC3339)
+	c.TokenExpiresAt = ""
+	c.BrokerETag = ""
 	c.ClientHeaders = nil
 	c.Account, c.AccountID = *account, r.Data.UserInfo.AccountID
 	if err := c.Save(); err != nil {
@@ -603,7 +1010,7 @@ func cmdLogin(args []string, debug bool) {
 // The refresh token must be sent in the `xtcl-access-token` header with an empty
 // body. The previous access token is invalidated; the refresh token is reused.
 func cmdRefresh(debug bool) {
-	c := mustConfig()
+	c := loadEffectiveConfig()
 	if err := doRefresh(c, debug); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -611,11 +1018,11 @@ func cmdRefresh(debug bool) {
 }
 
 func doRefresh(c *config.Config, debug bool) error {
-	if c.NoRefresh || noRefreshFlag || harPath != "" {
-		return fmt.Errorf("token refresh is disabled (no-refresh / HAR mode) to avoid invalidating logins on other devices; re-import a fresh capture with `rayneo har <file.har>`")
+	if c.NoRefresh || noRefreshFlag || harPath != "" || hasBroker(c) {
+		return fmt.Errorf("token refresh is disabled (no-refresh / broker / HAR mode) to avoid invalidating logins on other devices; use `rayneo sync` or `rayneo har <file.har>`")
 	}
 	if c.RefreshToken == "" {
-		return fmt.Errorf("no refreshToken stored; run `rayneo har <file.har>` or `rayneo login`")
+		return fmt.Errorf("no refreshToken stored; run `rayneo sync`, `rayneo har <file.har>`, or `rayneo login`")
 	}
 	cl := newClient(c, debug, map[string]string{"xtcl-access-token": c.RefreshToken})
 	resp, body, err := cl.Call("POST", "/authapi/token/refresh", nil, nil)
@@ -665,11 +1072,11 @@ func authExpired(body []byte) bool {
 func warnAuthExpired(c *config.Config) {
 	switch {
 	case c.Token == "":
-		fmt.Fprintln(os.Stderr, "auth: missing token — prefer `rayneo har <file.har>` (or `-har <file.har>`) to import a captured token without logging out other devices")
+		fmt.Fprintln(os.Stderr, "auth: missing token — prefer `rayneo sync` (Token Broker) or `rayneo har <file.har>` to authenticate without logging out other devices")
 	case c.NoRefresh || noRefreshFlag || harPath != "":
-		fmt.Fprintln(os.Stderr, "auth: access token expired or invalid (auto-refresh is disabled to protect other devices; re-capture and run `rayneo har <file.har>`)")
+		fmt.Fprintln(os.Stderr, "auth: access token expired or invalid (auto-refresh is disabled to protect other devices; run `rayneo sync` or re-capture with `rayneo har <file.har>`)")
 	default:
-		fmt.Fprintln(os.Stderr, "auth: access token expired or invalid (prefer `rayneo har <file.har>` to update token without logging out other devices)")
+		fmt.Fprintln(os.Stderr, "auth: access token expired or invalid (prefer `rayneo sync` or `rayneo har <file.har>` to update token without logging out other devices)")
 	}
 }
 
@@ -679,6 +1086,34 @@ func callWithAuth(cl *api.Client, method, path string, q url.Values, payload any
 		return nil, nil, err
 	}
 	if authExpired(body) {
+		if brokerAutoSyncActive(cl.Cfg) {
+			failedTok := cl.Cfg.Token
+			bURL, bSecret := effectiveBroker(cl.Cfg)
+			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+			bResp, _, bErr := broker.Fetch(ctx, bURL, bSecret, "")
+			cancel()
+			if bErr != nil {
+				fmt.Fprintf(os.Stderr, "auth: token expired and broker sync failed (%v) — open/wake the RayNeo App on your phone (with Loon running) to sync a fresh token\n", bErr)
+				return resp, body, nil
+			}
+			if bResp != nil && strings.TrimSpace(bResp.AccessToken) != "" && strings.TrimSpace(bResp.AccessToken) != failedTok {
+				broker.ApplyToConfig(cl.Cfg, bResp)
+				if serr := cl.Cfg.Save(); serr != nil {
+					fmt.Fprintf(os.Stderr, "broker: save config: %v\n", serr)
+				}
+				fmt.Fprintf(os.Stderr, "broker: token expired, synced fresh token %s (rev %d) and retrying\n", mask(cl.Cfg.Token), bResp.Revision)
+				retryResp, retryBody, retryErr := cl.Call(method, path, q, payload)
+				if retryErr != nil {
+					return nil, nil, retryErr
+				}
+				if authExpired(retryBody) {
+					fmt.Fprintln(os.Stderr, "auth: freshly synced broker token was also rejected (401) — open/wake the RayNeo App on your phone (with Loon running) to trigger a fresh token sync")
+				}
+				return retryResp, retryBody, nil
+			}
+			fmt.Fprintln(os.Stderr, "auth: access token expired and broker still has the same token — open/wake the RayNeo App on your phone (with Loon running) to sync a fresh token, then retry")
+			return resp, body, nil
+		}
 		if cl.Cfg.CanRefresh() && !noRefreshFlag && harPath == "" {
 			if rerr := doRefresh(cl.Cfg, false); rerr == nil {
 				return cl.Call(method, path, q, payload)

@@ -7,28 +7,62 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // AppVersion mirrors the mobile client so the gateway sees a familiar value.
 const AppVersion = "1.0.21"
 
 type Config struct {
-	BaseURL       string            `json:"base_url"`
-	Token         string            `json:"access_token,omitempty"`
-	RefreshToken  string            `json:"refresh_token,omitempty"`
-	NoRefresh     bool              `json:"no_refresh,omitempty"`
-	TokenSource   string            `json:"token_source,omitempty"`
-	TokenTime     string            `json:"token_captured_at,omitempty"`
-	Account       string            `json:"account,omitempty"`
-	AccountID     int64             `json:"account_id,omitempty"`
-	Region        string            `json:"region"` // cn | us | sg | eu
-	DeviceID      string            `json:"device_id"`
-	ClientHeaders map[string]string `json:"client_headers,omitempty"`
+	BaseURL        string            `json:"base_url"`
+	Token          string            `json:"access_token,omitempty"`
+	RefreshToken   string            `json:"refresh_token,omitempty"`
+	NoRefresh      bool              `json:"no_refresh,omitempty"`
+	TokenSource    string            `json:"token_source,omitempty"`
+	TokenTime      string            `json:"token_captured_at,omitempty"`
+	TokenExpiresAt string            `json:"token_expires_at,omitempty"`
+	BrokerURL      string            `json:"broker_url,omitempty"`
+	BrokerSecret   string            `json:"broker_secret,omitempty"`
+	BrokerETag     string            `json:"broker_etag,omitempty"`
+	Account        string            `json:"account,omitempty"`
+	AccountID      int64             `json:"account_id,omitempty"`
+	Region         string            `json:"region"` // cn | us | sg | eu
+	DeviceID       string            `json:"device_id"`
+	ClientHeaders  map[string]string `json:"client_headers,omitempty"`
+}
+
+// EffectiveBroker returns the broker base URL and Bearer secret, preferring
+// RAYNEO_BROKER_URL / RAYNEO_BROKER_SECRET environment variables over stored
+// config values.
+func (c *Config) EffectiveBroker() (url, secret string) {
+	url = strings.TrimSpace(os.Getenv("RAYNEO_BROKER_URL"))
+	if url == "" && c != nil {
+		url = strings.TrimSpace(c.BrokerURL)
+	}
+	url = strings.TrimRight(url, "/")
+
+	secret = strings.TrimSpace(os.Getenv("RAYNEO_BROKER_SECRET"))
+	if secret == "" && c != nil {
+		secret = strings.TrimSpace(c.BrokerSecret)
+	}
+	return url, secret
+}
+
+// HasBroker reports whether both a broker URL and secret are configured
+// (via environment variables or stored config).
+func (c *Config) HasBroker() bool {
+	u, s := c.EffectiveBroker()
+	return u != "" && s != ""
 }
 
 // CanRefresh reports whether token renewal is allowed and has a refresh token.
+// Token refresh is always disabled when NoRefresh is set or when a Token Broker
+// is configured, so the CLI never invalidates the mobile App's session.
 func (c *Config) CanRefresh() bool {
-	return !c.NoRefresh && c.RefreshToken != ""
+	if c == nil || c.NoRefresh || c.HasBroker() {
+		return false
+	}
+	return c.RefreshToken != ""
 }
 
 // RegionCode maps the stored region to the gateway's region header value.

@@ -1,0 +1,53 @@
+# Example systemd unit for RayNeo Token Broker (Scheme A passive access-token mirror).
+#
+# Quick setup:
+#   1. Build and install binary:
+#        go build -trimpath -ldflags="-s -w" -o /usr/local/bin/rayneo-broker ./broker/server
+#   2. Create service user:
+#        sudo useradd --system --no-create-home --shell /usr/sbin/nologin rayneo-broker
+#   3. Create secret env file (0600, owned by root:rayneo-broker or root:root):
+#        sudo install -d -m 0750 -o root -g rayneo-broker /etc/rayneo-broker
+#        printf 'BROKER_SECRET=%s\n' "$(openssl rand -hex 32)" | sudo tee /etc/rayneo-broker/broker.env >/dev/null
+#        sudo chown root:rayneo-broker /etc/rayneo-broker/broker.env
+#        sudo chmod 0640 /etc/rayneo-broker/broker.env
+#   4. Install unit & start:
+#        sudo cp broker/server/rayneo-broker.service /etc/systemd/system/
+#        sudo systemctl daemon-reload
+#        sudo systemctl enable --now rayneo-broker
+#
+# Put Caddy, Nginx, or Cloudflare Tunnel in front of 127.0.0.1:8787 for HTTPS.
+
+[Unit]
+Description=RayNeo Token Broker (Passive Access-Token Mirror)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rayneo-broker
+Group=rayneo-broker
+EnvironmentFile=/etc/rayneo-broker/broker.env
+ExecStart=/usr/local/bin/rayneo-broker -listen 127.0.0.1:8787 -state /var/lib/rayneo-broker/state.json
+StateDirectory=rayneo-broker
+StateDirectoryMode=0700
+
+Restart=on-failure
+RestartSec=5s
+
+# Security hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

@@ -4,9 +4,11 @@ description: >-
   Query and export RayNeo AI glasses (雷鸟 AI 眼镜) "全天智记"
   (lifelog) data via the `rayneo` CLI: daily events, GPS trail points, AI daily
   journals (每日故事), full speaker-attributed transcripts (对话与录音逐句转录), assistant tasks,
-  AI chats, and suggestions, or import `xtcl-access-token` from `.har` packet captures
-  without invalidating mobile App logins. Activate whenever the user mentions RayNeo,
-  雷鸟眼镜, 全天智记, lifelog, 眼镜录音/转录, 每日故事, transcripts, or `.har` token extraction for RayNeo.
+  AI chats, and suggestions, or sync `xtcl-access-token` passively via a Scheme A
+  Token Broker (`rayneo sync`) / `.har` packet captures without invalidating mobile
+  App logins. Activate whenever the user mentions RayNeo, 雷鸟眼镜, 全天智记, lifelog,
+  眼镜录音/转录, 每日故事, transcripts, `rayneo sync`, Token Broker, Loon sync, or `.har`
+  token extraction for RayNeo.
 ---
 
 # RayNeo AI Lifelog CLI (`rayneo`)
@@ -33,14 +35,28 @@ Operate the `rayneo` CLI (`github.com/VanceHud/rayneo-cli`) to query and export 
 
 ## Authentication Rules (CRITICAL — Read First)
 
-1. **Always prefer `.har` token extraction (`har` / `-har`) over SMS login or token refresh:**
+1. **Always prefer Scheme A Passive Token Broker (`rayneo sync`) or `.har` token extraction (`har` / `-har`) over SMS login or token refresh:**
    - **Why**: Calling `POST /identify/quickLogin` (`rayneo login`) invalidates the mobile App's `refreshToken`; calling `POST /authapi/token/refresh` (`rayneo refresh`) **immediately invalidates** the mobile App's active `access_token`, kicking the phone App offline.
-   - **Persistent import (recommended)**:
+   - **Option A — Scheme A Passive Token Broker (`rayneo sync`, best for ongoing automatic sync)**:
+     - The mobile RayNeo App remains the sole token-refresh authority; an iOS Loon plugin passively mirrors only `access_token` + safe device headers (never `refreshToken`) to a private Token Broker.
+     - First-time setup (saves `broker_url` & `broker_secret` into `0600` `config.json`, forces `no_refresh: true`, clears `refresh_token`, and optionally verifies via `GET /profileapi/v1/profile/query`):
+       ```bash
+       rayneo sync -url https://your-broker.workers.dev -secret <secret> -verify
+       ```
+     - Subsequent sync & inspection:
+       ```bash
+       rayneo sync            # conditional ETag pull (304 Not Modified when unchanged)
+       rayneo sync -force     # skip If-None-Match and force full fetch
+       rayneo sync -status    # show broker URL, masked secret, token fingerprint, and expiry
+       rayneo sync -clear     # clear broker_url, broker_secret, broker_etag
+       ```
+     - Once configured (via `config.json`, `RAYNEO_BROKER_URL`/`RAYNEO_BROKER_SECRET`, or `-broker-url`/`-broker-secret`), query commands **auto-sync** before requests when token is missing/expired and **transparently retry once on 401** if the broker has a fresher token (bypassed when `-har` is active).
+   - **Option B — Persistent `.har` import (zero-deployment alternative)**:
      ```bash
      rayneo har ./capture.har -verify
      ```
      Extracts the newest verified `xtcl-access-token` and safe device headers from Loon / Reqable / Proxyman / Charles `.har` files, clears `refresh_token`, and sets `no_refresh: true`.
-   - **One-off ephemeral run (does not modify `config.json`)**:
+   - **One-off ephemeral `.har` run (does not modify `config.json`, bypasses broker auto-sync)**:
      ```bash
      rayneo -har ./capture.har events -date YYYY-MM-DD
      ```
@@ -48,10 +64,12 @@ Operate the `rayneo` CLI (`github.com/VanceHud/rayneo-cli`) to query and export 
 2. **Check current session before querying**:
    ```bash
    rayneo whoami
+   rayneo sync -status   # if using a Token Broker
    ```
 3. **Handling `401 Authentication failed` or `Missing token`**:
    - **NEVER** run `rayneo refresh`, `rayneo sendcode`, or `rayneo login` unless the user explicitly asks to authenticate via SMS (and understands it will affect their phone session).
-   - Access tokens expire after ~2 hours (or rotate when the mobile App refreshes its own session). When `401` occurs, ask the user for a fresh `.har` capture from their phone, import it with `rayneo har ./capture.har -verify`, and remind them to delete the `.har` afterward.
+   - **If a Token Broker is configured**: run `rayneo sync -force -verify`. If the broker still returns the same expired token (or `404 no token synced yet`), ask the user to **open/wake the RayNeo App on their phone (with Loon running)** so Loon mirrors a fresh `access_token`, then retry.
+   - **If using `.har` mode**: ask the user for a fresh `.har` capture from their phone, import it with `rayneo har ./capture.har -verify`, and remind them to delete the `.har` afterward.
    - For step-by-step iOS & Android packet capture instructions, read [references/har-capture-guide.md](references/har-capture-guide.md).
 
 ---
@@ -131,5 +149,5 @@ rayneo cache stat
   - `refresh` (subcommand `rayneo refresh`): **token renewal** — calls `POST /authapi/token/refresh`, invalidating the phone App's active access token (blocked automatically in HAR / `no_refresh` mode).
 - **`jd -date` vs `journal`**: `rayneo journal` calls `GET /lifelog/api/v1/journal/latest`, which ignores `-date` and only returns the single most recent journal. Always use `rayneo jd -date YYYY-MM-DD` to fetch a specific date's 每日故事.
 - **`cc` (Live Captions / 实时字幕) limitation**: The backend only stores task metadata for `cc` tasks, not sentence-level `clips`. Only lifelog conversation events (`full`) and `recording` tasks contain speaker-attributed `clips`.
-- **Machine-readable CLI spec**: Run `rayneo help --json` to inspect all 24 commands, flags, HTTP paths, and `read_only` markers programmatically.
-- **Environment overrides**: Supports `RAYNEO_HAR`, `RAYNEO_TOKEN`, `RAYNEO_NO_REFRESH=1`, `XDG_CONFIG_HOME`, and optional `RAYNEO_APP_ID` / `RAYNEO_APP_KEY` signing overrides.
+- **Machine-readable CLI spec**: Run `rayneo help --json` to inspect all 25 commands, flags, HTTP paths, and `read_only` markers programmatically.
+- **Environment overrides**: Supports `RAYNEO_BROKER_URL`, `RAYNEO_BROKER_SECRET`, `RAYNEO_HAR`, `RAYNEO_TOKEN`, `RAYNEO_NO_REFRESH=1`, `XDG_CONFIG_HOME`, and optional `RAYNEO_APP_ID` / `RAYNEO_APP_KEY` signing overrides.

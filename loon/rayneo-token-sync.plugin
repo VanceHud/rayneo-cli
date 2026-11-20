@@ -1,0 +1,18 @@
+#!name = RayNeo Token Sync
+#!desc = 被动只读同步 RayNeo 眼镜 App 的 Access Token 至自建 Token Broker（绝不触碰 refreshToken，不踢手机端登录）
+#!author = VanceHud
+#!homepage = https://github.com/VanceHud/rayneo-cli
+#!tag = RayNeo, 工具
+
+[Argument]
+broker_url = input, "", tag = Broker URL, desc = Token Broker 服务地址（例如 https://rayneo-broker.example.workers.dev 或 http://100.x.x.x:8787）
+broker_secret = input, "", tag = Broker Secret, desc = Broker Bearer 认证密钥（需与服务端 BROKER_SECRET 一致）
+notify = switch, false, tag = 同步通知, desc = 捕获并成功同步新 Access Token 时弹出 iOS 通知
+debug = switch, false, tag = 调试日志, desc = 在 Loon 脚本日志中输出脱敏诊断信息（绝不打印完整 Token 或 Secret）
+
+[Script]
+http-response ^https:\/\/xr-api-[a-z0-9-]+\.rayneo\.(cn|com)\/(authapi\/token\/refresh|identify\/quickLogin)(\?.*)?$ script-path = https://raw.githubusercontent.com/VanceHud/rayneo-cli/main/loon/rayneo-token-sync.js, requires-body = true, timeout = 10, argument=[{broker_url},{broker_secret},{notify},{debug}], tag = RayNeo Token Sync (Auth Response)
+http-request ^https:\/\/xr-api-[a-z0-9-]+\.rayneo\.(cn|com)\/(?!authapi\/token\/refresh|identify\/quickLogin|identify\/common\/sendVerifyCode) script-path = https://raw.githubusercontent.com/VanceHud/rayneo-cli/main/loon/rayneo-token-sync.js, timeout = 10, argument=[{broker_url},{broker_secret},{notify},{debug}], tag = RayNeo Token Sync (Header Sniff)
+
+[MITM]
+hostname = xr-api-p.rayneo.cn, xr-api-*.rayneo.cn, xr-api-*.rayneo.com

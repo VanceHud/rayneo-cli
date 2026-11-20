@@ -22,7 +22,9 @@ $ rayneo events -date 2026-11-01 | jq -r '.data.events[] | "\(.startTimeFormatte
 ## Highlights
 
 - **Pure Go Stdlib Single Binary**: Zero third-party runtime or Go module dependencies. Compiles into a single portable `rayneo` binary for macOS, Linux, and Windows (`amd64` / `arm64`).
-- **Non-Intrusive `.har` Token Import (Recommended)**: Extracts your active `xtcl-access-token` and safe client headers directly from a `.har` packet capture while clearing `refreshToken` and enforcing `no_refresh=true` — **never kicking your mobile App session offline**.
+- **Non-Intrusive No-Kickout Auth (Passive Token Broker + `.har` Import)**:
+  - **Scheme A · Passive Token Broker Auto-Sync (Recommended)**: Pair the bundled iOS Loon plugin ([`loon/`](./loon/README.md)) with a private Token Broker ([`broker/`](./broker/README.md) — Cloudflare Workers + SQLite Durable Object or self-hosted Go server). Your mobile App remains the sole authority for token renewal (zero `refreshToken` ever leaves your phone), while `rayneo sync` and transparent 401 auto-recovery keep the CLI fresh **without ever kicking your mobile App offline**.
+  - **`.har` Capture Import (Zero-Setup Alternative)**: Extracts your active `xtcl-access-token` and safe client headers directly from a `.har` packet capture while clearing `refreshToken` and enforcing `no_refresh=true`.
 - **Unified Dual-Store Transcripts**: A single `rayneo full` command seamlessly merges lifelog conversation transcripts (`/lifelog/api/v1/events/{id}/full`) and standalone audio recording tasks (`/clsapi/aiTask/getDataAllByTaskId`), exporting speaker labels, millisecond timestamps, and translations in `md`, `txt`, `srt`, or `json`.
 - **Smart On-Disk Cache**: Historical days are cached locally for 30 days (`0600` permissions), making repeated queries and resumed bulk exports **0-network-request** operations. Pass `-refresh` anytime to bypass the local cache.
 - **Gentle Bulk Archiving**: `rayneo export` enforces built-in `400ms` request spacing to archive date ranges into raw JSON, UTF-8 BOM CSV (Excel-ready), and structured Markdown, while `rayneo report` compiles exported daily stories into a single offline Markdown report.
@@ -67,24 +69,47 @@ npx skills add VanceHud/rayneo-cli
 
 ---
 
-## Authentication Guide (Why `.har` Mode Is Recommended)
+## Authentication Guide (Why Passive Broker / `.har` Mode Is Recommended)
 
 RayNeo's backend enforces strict single-session token rotation:
 
 1. Logging in via SMS (`POST /identify/quickLogin`) invalidates your phone App's `refreshToken`.
 2. Calling token renewal (`POST /authapi/token/refresh`) **immediately invalidates** the currently active `access_token`, kicking your mobile App offline.
 
-To use `rayneo` alongside your phone without disrupting mobile sync, **always prefer importing a token from a `.har` capture** (see [`skills/rayneo-cli/references/har-capture-guide.md`](./skills/rayneo-cli/references/har-capture-guide.md) for iOS/Android capture steps):
+To use `rayneo` alongside your phone without disrupting mobile sync, **always prefer Scheme A (Passive Token Broker) or `.har` capture import** — both clear `refresh_token` and enforce `no_refresh=true` so the CLI never calls `/authapi/token/refresh`:
 
-### Option 1: Import from `.har` Capture (Recommended — Keeps Phone Logged In)
+### Option 1: Scheme A · Passive Token Broker + Loon Auto-Sync (Recommended — Seamless & Keeps Phone Logged In)
 
-Capture a brief session against `xr-api-p.rayneo.cn` using Loon, Reqable, Proxyman, or Charles and export `capture.har`:
+Let the mobile RayNeo App remain the sole token-refresh authority while the iOS Loon plugin ([`loon/`](./loon/README.md)) passively mirrors the active `access_token` and safe client headers to your private Token Broker ([`broker/`](./broker/README.md) — Cloudflare Workers or self-hosted Go server). No `refreshToken` is ever captured, transmitted, or stored:
+
+```bash
+# 1) Bind your private broker once and fetch the latest token (saved to 0600 config.json; -verify checks live)
+rayneo sync -url https://your-broker.workers.dev -secret <your-broker-secret> -verify
+
+# 2) Run any query command seamlessly:
+#    - Auto-syncs before requests if local token is missing or past token_expires_at
+#    - On HTTP/API 401, force-fetches from broker and transparently retries once if a fresher token arrived
+rayneo count
+rayneo events -date 2026-11-01
+
+# 3) Broker management commands
+rayneo sync             # Conditional ETag pull (304 Not Modified when unchanged)
+rayneo sync -force      # Skip If-None-Match ETag and force full fetch
+rayneo sync -status     # Inspect broker URL, masked secret, token fingerprint, and expiry
+rayneo sync -clear      # Remove broker_url, broker_secret, and broker_etag from config
+```
+
+> **Tip**: If your phone has been idle and the broker still holds an expired token, `rayneo` prints an actionable hint on `stderr` asking you to open/wake the RayNeo App on your phone (with Loon running) to sync a fresh token. You can also override broker settings ephemerally via `RAYNEO_BROKER_URL` / `RAYNEO_BROKER_SECRET` or global flags `-broker-url` / `-broker-secret`.
+
+### Option 2: Import from `.har` Capture (Zero-Deployment Alternative — Keeps Phone Logged In)
+
+Capture a brief session against `xr-api-p.rayneo.cn` using Loon, Reqable, Proxyman, or Charles and export `capture.har` (see [`skills/rayneo-cli/references/har-capture-guide.md`](./skills/rayneo-cli/references/har-capture-guide.md) for iOS/Android steps):
 
 ```bash
 # 1) Persistent import (clears refreshToken, sets no_refresh=true, saves to 0600 config.json)
 rayneo har ./capture.har -verify
 
-# Or: One-off ephemeral run (never touches ~/.config/rayneo-cli/config.json and never refreshes)
+# Or: One-off ephemeral run (never touches ~/.config/rayneo-cli/config.json, bypasses broker auto-sync, never refreshes)
 rayneo -har ./capture.har events -date 2026-11-01
 
 # 2) Inspect active session & refresh protection status
@@ -93,7 +118,7 @@ rayneo whoami
 
 > **Note**: Access tokens typically last ~2 hours (or rotate when the mobile App refreshes itself). Whenever you see `401 Authentication failed`, capture a fresh `.har` and run `rayneo har ./capture.har -verify`. Delete the `.har` file once imported.
 
-### Option 2: Standalone SMS Verification Login (Fallback)
+### Option 3: Standalone SMS Verification Login (Fallback)
 
 Use only if you do not mind re-authenticating on your phone later:
 
@@ -138,14 +163,15 @@ rayneo report -dir ./rayneo-export -out ./rayneo-export/weekly-report.md -title 
 rayneo events -date 2026-11-01 -refresh
 ```
 
-### Command Cheatsheet (All 24 Subcommands)
+### Command Cheatsheet (All 25 Subcommands)
 
 For complete flag tables, response schemas, cache policies, and troubleshooting, see **[`docs/CLI.md`](./docs/CLI.md)** (or run `rayneo help --json`).
 
 | Category | Subcommands | Description |
 |---|---|---|
-| **Auth & Config** | `har` | **[Recommended]** Import `access_token` & client headers from `.har` (`no_refresh=true`) |
-| | `whoami` / `config` / `logout` | Inspect session status / update base URL, region, or token / clear saved credentials |
+| **Auth & Config** | `sync` | **[Recommended · Auto-Sync]** Configure or pull active `access_token` from Scheme A Token Broker (`-verify` / `-force` / `-status` / `-clear`, `no_refresh=true`) |
+| | `har` | **[Recommended · Zero-Setup]** Import `access_token` & client headers from `.har` (`no_refresh=true`) |
+| | `whoami` / `config` / `logout` | Inspect session & broker status / update base URL, region, token, or broker / clear saved credentials |
 | | `sendcode` / `login` / `refresh` | Fallback SMS login & manual token renewal (warning: affects other logged-in devices) |
 | **Read-Only Queries** | `count` / `calendar` | Overall item counts / monthly lifelog availability & one-line daily summaries |
 | | `events` / `event` | Daily events + GPS `trailPoints` / single-event summary, timestamped outline & sub-events |

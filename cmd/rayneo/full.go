@@ -72,7 +72,7 @@ func toInt64(v any) int64 {
 
 // fetchFull pulls the full event detail incl. conversation transcripts.
 func fetchFull(cl *api.Client, eventID string) (*fullEvent, error) {
-	_, body, err := cl.Call("GET", "/lifelog/api/v1/events/"+eventID+"/full", nil, nil)
+	_, body, err := callWithAuth(cl, "GET", "/lifelog/api/v1/events/"+eventID+"/full", nil, nil)
 	if err != nil {
 		return nil, err
 	}
