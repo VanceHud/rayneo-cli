@@ -45,7 +45,7 @@ Key behaviors:
 
 ## Option 1: Cloudflare Workers (SQLite Durable Object)
 
-Uses a SQLite-backed Durable Object (`TokenBrokerDO` with `new_sqlite_classes` in [`cloudflare/wrangler.jsonc`](./cloudflare/wrangler.jsonc)), which provides strong consistency on **both Cloudflare Workers Free and Paid plans**.
+Uses a SQLite-backed Durable Object (`TokenBrokerDO` with `storage: "sqlite"` in [`cloudflare/cloudflare.config.ts`](./cloudflare/cloudflare.config.ts)), which provides strong consistency on **both Cloudflare Workers Free and Paid plans**.
 
 ### Prerequisites
 
@@ -60,23 +60,25 @@ openssl rand -hex 32
 
 Save this value — you will configure it in Cloudflare Workers, your iOS Loon plugin, and `rayneo sync`.
 
-### 2. Install & deploy with Wrangler
+### 2. Install & deploy with `cf` CLI
 
 ```bash
 cd broker/cloudflare
 npm install
 
 # Log in to Cloudflare (first time only)
-npx wrangler login
+npx cf auth login
 
-# Store BROKER_SECRET securely as a Worker secret (never in wrangler.jsonc)
-npx wrangler secret put BROKER_SECRET
-
-# Deploy the Worker and create the SQLite Durable Object migration
-npm run deploy
+# Deploy the Worker, provision the SQLite Durable Object, and upload BROKER_SECRET
+# (store the secret only in a temporary 0600 file outside git and remove it right after)
+SEC_FILE="$(mktemp /tmp/rayneo-cf-secrets.XXXXXX.json)"
+chmod 600 "$SEC_FILE"
+printf '{"BROKER_SECRET":"%s"}\n' "<your-secret>" > "$SEC_FILE"
+npx cf deploy --secrets-file "$SEC_FILE"
+rm -f "$SEC_FILE"
 ```
 
-Wrangler prints your HTTPS URL (for example `https://rayneo-token-broker.<your-subdomain>.workers.dev`). You may also bind a custom domain in the Cloudflare Dashboard under **Workers & Pages → Settings → Domains & Routes**.
+`cf deploy` prints your HTTPS URL (for example `https://rayneo-token-broker.<your-subdomain>.workers.dev`). You may also bind a custom domain in the Cloudflare Dashboard under **Workers & Pages → Settings → Domains & Routes** (recommended in mainland China so iOS Loon and CLI can reach it directly without proxying `*.workers.dev`).
 
 ### 3. Local development & unit tests
 
@@ -87,14 +89,14 @@ cd broker/cloudflare
 npm test
 ```
 
-To typecheck against `@cloudflare/workers-types` (after `npm install`):
+To regenerate Worker types and typecheck (after `npm install`):
 
 ```bash
 npm run types
 npm run typecheck
 ```
 
-To run locally with Wrangler:
+To run locally with `cf dev`:
 
 ```bash
 # Create local-only secret file (gitignored)

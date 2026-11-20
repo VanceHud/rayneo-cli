@@ -1,4 +1,8 @@
 node_modules/
+.cloudflare/
 .wrangler/
 .dev.vars
+.env
+.env.*
 worker-configuration.d.ts
+package-lock.json
